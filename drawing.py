@@ -33,6 +33,7 @@ wheel_radius = 80
 ser   = None
 dirty = False
 
+prev_leds = {}   # dict mapping pixel_index -> (R, G, B)
 
 # Color helpers
 
@@ -197,6 +198,7 @@ def set_tool(tool_name):
 
 def new_image():
     global image, draw_img, dirty
+    prev_leds.clear()
     image = Image.new('RGBA',
                 (GRID_COLS * BLOCK_SIZE, GRID_ROWS * BLOCK_SIZE),
                 (0, 0, 0, 255))
@@ -226,29 +228,43 @@ def save_image():
 # Serial / Arduino
 
 def _build_frame():
-    """Pack the current canvas into the serial packet."""
-    pkt = bytearray([0xFF, 0xFE])
+    global prev_leds
+    total_cols = NUM_MATRICES * GRID_COLS  # GRID_COLS = 32 per matrix
+    changed = []
+
     for row in range(GRID_ROWS):
-        for col in range(GRID_COLS):
+        for col in range(total_cols):
+            pixel_index = row * total_cols + col
             px = image.getpixel((col * BLOCK_SIZE, row * BLOCK_SIZE))
-            pkt.extend(px[:3])
+            rgb = (px[0], px[1], px[2])
+            if prev_leds.get(pixel_index) != rgb:
+                changed.append((pixel_index, rgb))
+
+    if not changed:
+        return None  # nothing to send
+
+    # Update cache
+    for pixel_index, rgb in changed:
+        prev_leds[pixel_index] = rgb
+
+    count = len(changed)
+    pkt = bytearray([0xFF, 0xFE, (count >> 8) & 0xFF, count & 0xFF])
+    for pixel_index, (r, g, b) in changed:
+        pkt.extend([(pixel_index >> 8) & 0xFF, pixel_index & 0xFF, r, g, b])
     return pkt
 
 def _serial_sender():
-    """Background thread: sends frames at ~30 fps when dirty."""
     global dirty, ser
     while True:
         time.sleep(1 / 30)
         if ser and ser.is_open and dirty:
             dirty = False
-            
-            # Debug
             frame = _build_frame()
-            print(f'Sending frame, payload bytes: {len(frame)}, first px: {frame[2:5]}')
-            
+            if frame is None:
+                continue
             try:
-                ser.write(_build_frame())
-                ser.read(1)         # wait for ACK 'K'
+                ser.write(frame)
+                ser.read(1)
             except Exception as e:
                 print(f'Send error: {e}')
                 ser = None
