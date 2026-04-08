@@ -9,7 +9,8 @@ import time
 
 # Config
 
-NUM_MATRICES   = 1      # number of chained 8×32 LED matrices (1-4 supported by Arduino code), MUST MATCH ARDUINO CODE
+NUM_MATRICES   = 4      # number of chained 8×32 LED matrices (1-4 supported by Arduino code), MUST MATCH ARDUINO CODE
+MATRIX_HEIGHT  = 8       # rows per matrix, MUST MATCH ARDUINO CODE
 BAUD_RATE      = 500000
 
 # Derived from NUM_MATRICES — don't change these manually
@@ -31,6 +32,7 @@ brightness = 0.5
 wheel_radius = 80
 
 ser   = None
+ser_lock = threading.Lock()
 dirty = False
 
 prev_leds = {}   # dict mapping pixel_index -> (R, G, B)
@@ -205,6 +207,35 @@ def new_image():
     draw_img = ImageDraw.Draw(image)
     dirty = True
     redraw_canvas()
+    _send_blackout()
+
+
+# Forces all LEDs to turn off
+def _send_blackout():
+    if not ser or not ser.is_open:
+        return
+    PHYSICAL_COLS = NUM_MATRICES * GRID_COLS
+    PHYSICAL_ROWS = MATRIX_HEIGHT
+    total = PHYSICAL_COLS * PHYSICAL_ROWS
+    CHUNK_SIZE = 40
+
+    with ser_lock:
+        try:
+            for chunk_start in range(0, total, CHUNK_SIZE):
+                chunk_end = min(chunk_start + CHUNK_SIZE, total)
+                count = chunk_end - chunk_start
+                pkt = bytearray([0xFF, 0xFE, (count >> 8) & 0xFF, count & 0xFF])
+                for pixel_index in range(chunk_start, chunk_end):
+                    pkt.extend([(pixel_index >> 8) & 0xFF, pixel_index & 0xFF, 0, 0, 0])
+                ser.write(pkt)
+                ack = ser.read(1)
+                if ack != b'K':
+                    _set_status('error', f'Blackout chunk {chunk_start}–{chunk_end} no ACK')
+                    return
+            _set_status('ok', 'Cleared')
+        except Exception as e:
+            _set_status('error', f'Blackout failed: {e}')
+
 
 def open_image():
     global image, draw_img
@@ -229,21 +260,28 @@ def save_image():
 
 def _build_frame():
     global prev_leds
-    total_cols = NUM_MATRICES * GRID_COLS  # GRID_COLS = 32 per matrix
     changed = []
 
-    for row in range(GRID_ROWS):
-        for col in range(total_cols):
-            pixel_index = row * total_cols + col
-            px = image.getpixel((col * BLOCK_SIZE, row * BLOCK_SIZE))
+    PHYSICAL_COLS = NUM_MATRICES * GRID_COLS   # 128 — full strip width
+    PHYSICAL_ROWS = MATRIX_HEIGHT              # 8
+
+    for canvas_row in range(GRID_ROWS):        # 0-31 in the UI
+        for canvas_col in range(GRID_COLS):    # 0-31 in the UI
+            # Convert canvas (col, row) to physical strip coordinates
+            matrix_index  = canvas_row // PHYSICAL_ROWS   # which matrix (0-3)
+            local_row     = canvas_row %  PHYSICAL_ROWS   # row within that matrix (0-7)
+            physical_col  = matrix_index * GRID_COLS + canvas_col  # col across full strip
+
+            pixel_index = local_row * PHYSICAL_COLS + physical_col
+
+            px  = image.getpixel((canvas_col * BLOCK_SIZE, canvas_row * BLOCK_SIZE))
             rgb = (px[0], px[1], px[2])
             if prev_leds.get(pixel_index) != rgb:
                 changed.append((pixel_index, rgb))
 
     if not changed:
-        return None  # nothing to send
+        return None
 
-    # Update cache
     for pixel_index, rgb in changed:
         prev_leds[pixel_index] = rgb
 
@@ -252,6 +290,24 @@ def _build_frame():
     for pixel_index, (r, g, b) in changed:
         pkt.extend([(pixel_index >> 8) & 0xFF, pixel_index & 0xFF, r, g, b])
     return pkt
+
+
+# Send a pre-built delta packet in chunks, waiting for ACK each time.
+def _send_frame_chunked(frame_pkt):
+    total_pixels = (frame_pkt[2] << 8) | frame_pkt[3]
+    pixel_data = frame_pkt[4:]
+    CHUNK_SIZE = 40
+
+    with ser_lock:
+        for i in range(0, total_pixels, CHUNK_SIZE):
+            chunk_pixels = pixel_data[i*5 : (i+CHUNK_SIZE)*5]
+            count = len(chunk_pixels) // 5
+            pkt = bytearray([0xFF, 0xFE, (count >> 8) & 0xFF, count & 0xFF])
+            pkt.extend(chunk_pixels)
+            ser.write(pkt)
+            ack = ser.read(1)
+            if ack != b'K':
+                raise Exception(f'No ACK at chunk offset {i}')
 
 def _serial_sender():
     global dirty, ser
@@ -263,12 +319,11 @@ def _serial_sender():
             if frame is None:
                 continue
             try:
-                ser.write(frame)
-                ser.read(1)
+                _send_frame_chunked(frame)
             except Exception as e:
                 print(f'Send error: {e}')
                 ser = None
-                root.after(0, lambda: _set_status('error', f'Lost connection: {e}'))
+                root.after(0, lambda err=e: _set_status('error', f'Lost connection: {err}'))
 
 def _refresh_ports():
     ports = [p.device for p in serial.tools.list_ports.comports()]
@@ -289,7 +344,7 @@ def _toggle_connect():
             _set_status('error', 'No port selected')
             return
         try:
-            ser = serial.Serial(port, BAUD_RATE, timeout=0.5)
+            ser = serial.Serial(port, BAUD_RATE, timeout=2)
             time.sleep(2)           # wait for Arduino reset
             _set_status('ok', f'Connected  {port}')
             connect_btn.config(text='Disconnect')
@@ -301,23 +356,23 @@ def _set_status(state, text):
     status_lbl.config(text=text, fg=colors.get(state, 'gray'))
 
 
-def _send_test():
-    """Send all-red frame directly, bypassing the dirty flag."""
-    if not ser or not ser.is_open:
-        _set_status('error', 'Not connected')
-        return
-    pkt = bytearray([0xFF, 0xFE])
-    for _ in range(GRID_ROWS * GRID_COLS):
-        pkt.extend((255, 0, 0))  # pure red on every LED
-    try:
-        ser.write(pkt)
-        response = ser.read(1)
-        if response == b'K':
-            _set_status('ok', 'Test OK — got ACK')
-        else:
-            _set_status('error', f'Test sent, no ACK (got {response!r})')
-    except Exception as e:
-        _set_status('error', f'Test failed: {e}')
+# def _send_test():
+#     """Send all-red frame directly, bypassing the dirty flag."""
+#     if not ser or not ser.is_open:
+#         _set_status('error', 'Not connected')
+#         return
+#     pkt = bytearray([0xFF, 0xFE])
+#     for _ in range(GRID_ROWS * GRID_COLS):
+#         pkt.extend((255, 0, 0))  # pure red on every LED
+#     try:
+#         ser.write(pkt)
+#         response = ser.read(1)
+#         if response == b'K':
+#             _set_status('ok', 'Test OK — got ACK')
+#         else:
+#             _set_status('error', f'Test sent, no ACK (got {response!r})')
+#     except Exception as e:
+#         _set_status('error', f'Test failed: {e}')
 
 
 # UI setup
@@ -410,8 +465,8 @@ def setup_app():
     tk.Button(tool_frame, text='Clear', width=5,
           command=new_image).pack(side='left', padx=2)
     
-    tk.Button(tool_frame, text='Test', width=5,
-          command=_send_test).pack(side='left', padx=2)
+    # tk.Button(tool_frame, text='Test', width=5,
+    #       command=_send_test).pack(side='left', padx=2)
 
     # Matrix config info
     tk.Label(sidebar, text='Matrix config',
