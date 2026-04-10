@@ -18,6 +18,7 @@ GRID_COLS = 32
 GRID_ROWS = 8 * NUM_MATRICES
 
 BLOCK_SIZE = 20          # UI pixel size in the editor (px per cell)
+CHUNK_SIZE = 20
 
 root        = None
 brush_color = '#000000'
@@ -217,7 +218,6 @@ def _send_blackout():
     PHYSICAL_COLS = NUM_MATRICES * GRID_COLS
     PHYSICAL_ROWS = MATRIX_HEIGHT
     total = PHYSICAL_COLS * PHYSICAL_ROWS
-    CHUNK_SIZE = 40
 
     with ser_lock:
         try:
@@ -296,7 +296,7 @@ def _build_frame():
 def _send_frame_chunked(frame_pkt):
     total_pixels = (frame_pkt[2] << 8) | frame_pkt[3]
     pixel_data = frame_pkt[4:]
-    CHUNK_SIZE = 40
+    
 
     with ser_lock:
         for i in range(0, total_pixels, CHUNK_SIZE):
@@ -345,7 +345,9 @@ def _toggle_connect():
             return
         try:
             ser = serial.Serial(port, BAUD_RATE, timeout=2)
-            time.sleep(2)           # wait for Arduino reset
+            time.sleep(3)           # wait for Arduino reset
+            ser.reset_input_buffer()
+            ser.reset_output_buffer()
             _set_status('ok', f'Connected  {port}')
             connect_btn.config(text='Disconnect')
         except Exception as e:
