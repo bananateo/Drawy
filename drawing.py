@@ -6,8 +6,12 @@ import serial
 import serial.tools.list_ports
 import threading
 import time
+import socket
 
 # Config
+
+ESP32_IP   = "192.168.1.XXX"  # MUST BE THE SAME AS SHOWN IN Serial Monitor
+ESP32_PORT = 1234
 
 NUM_MATRICES   = 4      # number of chained 8×32 LED matrices (1-4 supported by Arduino code), MUST MATCH ARDUINO CODE
 MATRIX_HEIGHT  = 8       # rows per matrix, MUST MATCH ARDUINO CODE
@@ -37,6 +41,30 @@ ser_lock = threading.Lock()
 dirty = False
 
 prev_leds = {}   # dict mapping pixel_index -> (R, G, B)
+
+# Wi-fi connection via socket wrapper to mimic serial.Serial interface (for ESP32 WiFi module)
+class WifiSerial:
+    def __init__(self, ip, port, timeout=2):
+        self._sock = socket.create_connection((ip, port), timeout=timeout)
+        self._sock.settimeout(timeout)
+        self.is_open = True
+
+    def write(self, data):
+        self._sock.sendall(data)
+
+    def read(self, n):
+        buf = b''
+        while len(buf) < n:
+            chunk = self._sock.recv(n - len(buf))
+            if not chunk:
+                raise ConnectionError("ESP32 disconnected")
+            buf += chunk
+        return buf
+
+    def close(self):
+        self._sock.close()
+        self.is_open = False
+
 
 # Color helpers
 
@@ -339,16 +367,9 @@ def _toggle_connect():
         _set_status('off', 'Disconnected')
         connect_btn.config(text='Connect')
     else:
-        port = port_var.get()
-        if not port:
-            _set_status('error', 'No port selected')
-            return
         try:
-            ser = serial.Serial(port, BAUD_RATE, timeout=2)
-            time.sleep(3)           # wait for Arduino reset
-            ser.reset_input_buffer()
-            ser.reset_output_buffer()
-            _set_status('ok', f'Connected  {port}')
+            ser = WifiSerial(ESP32_IP, ESP32_PORT, timeout=2)
+            _set_status('ok', f'Connected  {ESP32_IP}:{ESP32_PORT}')
             connect_btn.config(text='Disconnect')
         except Exception as e:
             _set_status('error', str(e))
