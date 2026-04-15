@@ -1,4 +1,5 @@
 #include <FastLED.h>
+#include <WiFi.h>
 
 #define NUM_MATRICES   4
 #define MATRIX_WIDTH   32
@@ -6,10 +7,18 @@
 #define TOTAL_LEDS     (NUM_MATRICES * MATRIX_WIDTH * MATRIX_HEIGHT)
 #define DATA_PIN       13
 
-CRGB leds[TOTAL_LEDS];
-
 #define HEADER_A 0xFF
 #define HEADER_B 0xFE
+
+// Wi-Fi config
+const char* WIFI_SSID = "ChangeToYourNetworkName"; // Do not upload secrets to github
+const char* WIFI_PASS = "YourPassword";
+const uint16_t TCP_PORT = 1234;
+
+WiFiServer server(TCP_PORT);
+WiFiClient client;
+
+CRGB leds[TOTAL_LEDS];
 
 bool needsShow = false;
 unsigned long lastShowTime = 0;
@@ -32,8 +41,8 @@ bool readBytes(uint8_t* dst, int n) {
   int received = 0;
   while (received < n) {
     if (millis() > timeout) return false;
-    if (Serial.available()) {
-      dst[received++] = Serial.read();
+    if (client.available()) {
+      dst[received++] = client.read();
     } else {
       yield();
     }
@@ -43,24 +52,49 @@ bool readBytes(uint8_t* dst, int n) {
 
 void setup() {
   FastLED.addLeds<WS2812B, DATA_PIN, GRB>(leds, TOTAL_LEDS);
-  FastLED.setBrightness(60);
+  FastLED.setBrightness(50);
   FastLED.clear();
   FastLED.show();
-  Serial.begin(500000);
+  
+  Serial.begin(115200); // Now used for debug
+
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.print("Connecting to Wi-Fi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println();
+  Serial.print("Connected! IP: ");
+  Serial.println(WiFi.localIP()); // see in Serial Monitor
+
+  server.begin();
+  Serial.print("TCP server listening on port ");
+  Serial.println(TCP_PORT);
 }
 
 void loop() {
+  // Accept a new client if none connected
+  if (!client || !client.connected()) {
+    client = server.accept();
+    if (client) {
+      Serial.println("Client connected");
+    } else {
+      return; // no client yet, nothing to do
+    }
+  }
+
   if (needsShow && millis() - lastShowTime >= SHOW_INTERVAL_MS) {
     FastLED.show();
     needsShow = false;
     lastShowTime = millis();
   }
 
-  if (Serial.available() < 2) return;
+  if (client.available() < 2) return;
 
-  uint8_t a = Serial.read();
+  uint8_t a = client.read();
   if (a != HEADER_A) return;
-  uint8_t b = Serial.read();
+  uint8_t b = client.read();
   if (b != HEADER_B) return;
 
   uint8_t count_bytes[2];
@@ -86,5 +120,5 @@ void loop() {
   }
 
   needsShow = true;
-  Serial.write('K');
+  client.write('K');
 }
