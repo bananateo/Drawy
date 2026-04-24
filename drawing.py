@@ -10,7 +10,7 @@ import socket
 
 # Config
 
-ESP32_IP   = "192.168.1.XXX"  # MUST BE THE SAME AS SHOWN IN Serial Monitor
+ESP32_IP   = "10.119.197.110"  # MUST BE THE SAME AS SHOWN IN Serial Monitor
 ESP32_PORT = 1234
 
 NUM_MATRICES   = 4      # number of chained 8×32 LED matrices (1-4 supported by Arduino code), MUST MATCH ARDUINO CODE

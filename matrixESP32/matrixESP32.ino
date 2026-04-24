@@ -1,5 +1,6 @@
 #include <FastLED.h>
 #include <WiFi.h>
+#include "secrets.h"
 
 #define NUM_MATRICES   4
 #define MATRIX_WIDTH   32
@@ -11,8 +12,7 @@
 #define HEADER_B 0xFE
 
 // Wi-Fi config
-const char* WIFI_SSID = "ChangeToYourNetworkName"; // Do not upload secrets to github
-const char* WIFI_PASS = "YourPassword";
+// Password and network name are in secrets.h
 const uint16_t TCP_PORT = 1234;
 
 WiFiServer server(TCP_PORT);
@@ -58,7 +58,7 @@ void setup() {
   
   Serial.begin(115200); // Now used for debug
 
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   Serial.print("Connecting to Wi-Fi");
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
