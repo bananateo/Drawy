@@ -10,7 +10,7 @@ import socket
 
 # Config
 
-ESP32_IP   = "10.119.197.110"  # MUST BE THE SAME AS SHOWN IN Serial Monitor
+ESP32_IP   = "10.180.227.110"  # MUST BE THE SAME AS SHOWN IN Serial Monitor
 ESP32_PORT = 1234
 
 NUM_MATRICES   = 4      # number of chained 8×32 LED matrices (1-4 supported by Arduino code), MUST MATCH ARDUINO CODE
@@ -321,21 +321,12 @@ def _build_frame():
 
 
 # Send a pre-built delta packet in chunks, waiting for ACK each time.
-def _send_frame_chunked(frame_pkt):
-    total_pixels = (frame_pkt[2] << 8) | frame_pkt[3]
-    pixel_data = frame_pkt[4:]
-    
-
+def _send_frame(frame_pkt):
     with ser_lock:
-        for i in range(0, total_pixels, CHUNK_SIZE):
-            chunk_pixels = pixel_data[i*5 : (i+CHUNK_SIZE)*5]
-            count = len(chunk_pixels) // 5
-            pkt = bytearray([0xFF, 0xFE, (count >> 8) & 0xFF, count & 0xFF])
-            pkt.extend(chunk_pixels)
-            ser.write(pkt)
-            ack = ser.read(1)
-            if ack != b'K':
-                raise Exception(f'No ACK at chunk offset {i}')
+        ser.write(frame_pkt)
+        ack = ser.read(1)
+        if ack != b'K':
+            raise Exception('No ACK received')
 
 def _serial_sender():
     global dirty, ser
@@ -347,7 +338,7 @@ def _serial_sender():
             if frame is None:
                 continue
             try:
-                _send_frame_chunked(frame)
+                _send_frame(frame)
             except Exception as e:
                 print(f'Send error: {e}')
                 ser = None
@@ -368,7 +359,7 @@ def _toggle_connect():
         connect_btn.config(text='Connect')
     else:
         try:
-            ser = WifiSerial(ESP32_IP, ESP32_PORT, timeout=2)
+            ser = WifiSerial(ESP32_IP, ESP32_PORT, timeout=5)
             _set_status('ok', f'Connected  {ESP32_IP}:{ESP32_PORT}')
             connect_btn.config(text='Disconnect')
         except Exception as e:

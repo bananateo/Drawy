@@ -1,6 +1,6 @@
 #include <FastLED.h>
 #include <WiFi.h>
-#include "secrets.h"
+#include "../secrets.h"
 
 #define NUM_MATRICES   4
 #define MATRIX_WIDTH   32
@@ -37,7 +37,7 @@ int getLEDIndex(int matrixIndex, int col, int row) {
 }
 
 bool readBytes(uint8_t* dst, int n) {
-  unsigned long timeout = millis() + 2000;
+  unsigned long timeout = millis() + 5000;
   int received = 0;
   while (received < n) {
     if (millis() > timeout) return false;
@@ -73,18 +73,40 @@ void setup() {
   Serial.println(TCP_PORT);
 }
 
-void loop() {
+void loop() 
+{
+  // reconnection logic
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("Wi-Fi lost, reconnecting...");
+    client.stop();
+    WiFi.disconnect();
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    unsigned long t = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - t < 10000) {
+      delay(500);
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("Reconnected!");
+    }
+    return;
+  }
+  
   // Accept a new client if none connected
-  if (!client || !client.connected()) {
+  if (!client || !client.connected()) 
+  {
     client = server.accept();
-    if (client) {
+    if (client) 
+    {
+      client.setNoDelay(true);
       Serial.println("Client connected");
-    } else {
+    } else 
+    {
       return; // no client yet, nothing to do
     }
   }
 
-  if (needsShow && millis() - lastShowTime >= SHOW_INTERVAL_MS) {
+  if (needsShow && millis() - lastShowTime >= SHOW_INTERVAL_MS) 
+  {
     FastLED.show();
     needsShow = false;
     lastShowTime = millis();
@@ -105,7 +127,8 @@ void loop() {
   int totalCols = NUM_MATRICES * MATRIX_WIDTH;
   uint8_t chunk[5];
 
-  for (uint16_t i = 0; i < count; i++) {
+  for (uint16_t i = 0; i < count; i++) 
+  {
     if (!readBytes(chunk, 5)) return;
 
     uint16_t pixelIndex = ((uint16_t)chunk[0] << 8) | chunk[1];
@@ -121,4 +144,4 @@ void loop() {
 
   needsShow = true;
   client.write('K');
-}
+}
