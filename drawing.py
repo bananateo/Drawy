@@ -24,6 +24,10 @@ GRID_ROWS = 8 * NUM_MATRICES
 BLOCK_SIZE = 20          # UI pixel size in the editor (px per cell)
 CHUNK_SIZE = 20
 
+# Wi-fi retry config
+MAX_RETRIES = 5
+RETRY_DELAY = 3
+
 root        = None
 brush_color = '#000000'
 is_painting = False
@@ -266,7 +270,7 @@ def _send_blackout():
 
 
 def open_image():
-    global image, draw_img
+    global image, draw_img, dirty
     path = filedialog.askopenfilename(
         filetypes=[('PNG files', '*.png'), ('All files', '*.*')])
     if path:
@@ -274,6 +278,8 @@ def open_image():
         image    = img.resize((GRID_COLS * BLOCK_SIZE, GRID_ROWS * BLOCK_SIZE),
                                Image.NEAREST)
         draw_img = ImageDraw.Draw(image)
+        prev_leds.clear()
+        dirty = True
         redraw_canvas()
 
 def save_image():
@@ -332,7 +338,9 @@ def _serial_sender():
     global dirty, ser
     while True:
         time.sleep(1 / 30)
-        if ser and ser.is_open and dirty:
+        if not ser or not ser.is_open:
+            continue
+        if dirty:
             dirty = False
             frame = _build_frame()
             if frame is None:
@@ -343,12 +351,32 @@ def _serial_sender():
                 print(f'Send error: {e}')
                 ser = None
                 root.after(0, lambda err=e: _set_status('error', f'Lost connection: {err}'))
+                # Auto-reconnect in background
+                root.after(0, lambda: connect_btn.config(text='Connect'))
+                threading.Thread(target=_connect_wifi, daemon=True).start()
 
 def _refresh_ports():
     ports = [p.device for p in serial.tools.list_ports.comports()]
     port_combo['values'] = ports
     if ports and not port_var.get():
         port_combo.current(0)
+
+def _connect_wifi(retries=MAX_RETRIES):
+    global ser
+    for attempt in range(1, retries + 1):
+        try:
+            _set_status('off', f'Connecting... (attempt {attempt}/{retries})')
+            ser = WifiSerial(ESP32_IP, ESP32_PORT, timeout=5)
+            _set_status('ok', f'Connected  {ESP32_IP}:{ESP32_PORT}')
+            connect_btn.config(text='Disconnect')
+            return True
+        except Exception as e:
+            ser = None
+            if attempt < retries:
+                time.sleep(RETRY_DELAY)
+    _set_status('error', f'Failed after {retries} attempts')
+    connect_btn.config(text='Connect')
+    return False
 
 def _toggle_connect():
     global ser
@@ -358,12 +386,8 @@ def _toggle_connect():
         _set_status('off', 'Disconnected')
         connect_btn.config(text='Connect')
     else:
-        try:
-            ser = WifiSerial(ESP32_IP, ESP32_PORT, timeout=5)
-            _set_status('ok', f'Connected  {ESP32_IP}:{ESP32_PORT}')
-            connect_btn.config(text='Disconnect')
-        except Exception as e:
-            _set_status('error', str(e))
+        # Run in a thread so the UI doesn't freeze during retries
+        threading.Thread(target=_connect_wifi, daemon=True).start()
 
 def _set_status(state, text):
     colors = {'ok': 'green', 'error': 'red', 'off': 'gray'}
