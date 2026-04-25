@@ -222,7 +222,12 @@ def flood_fill(xi, yi):
         visited.add((x, y))
         stack.extend([(x+1,y),(x-1,y),(x,y+1),(x,y-1)])
     for x, y in visited:
-        paint_pixel(x, y, brush_color)
+        x0, y0 = x * BLOCK_SIZE, y * BLOCK_SIZE
+        draw_img.rectangle([(x0, y0), (x0+BLOCK_SIZE-1, y0+BLOCK_SIZE-1)], fill=(*fill_rgb, 255))
+    
+    global dirty
+    dirty = True
+    redraw_canvas()
 
 def set_tool(tool_name):
     global current_tool

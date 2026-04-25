@@ -58,7 +58,14 @@ void setup() {
   
   Serial.begin(115200); // Now used for debug
 
+  IPAddress staticIP(10, 180, 227, 110);
+  IPAddress gateway(10, 180, 227, 1);
+  IPAddress subnet(255, 255, 255, 0);
+  IPAddress dns(8, 8, 8, 8);
+
+  WiFi.config(staticIP, gateway, subnet, dns);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
   Serial.print("Connecting to Wi-Fi");
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
