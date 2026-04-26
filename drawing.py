@@ -6,12 +6,8 @@ import serial
 import serial.tools.list_ports
 import threading
 import time
-import socket
 
 # Config
-
-ESP32_IP   = "10.180.227.110"  # MUST BE THE SAME AS SHOWN IN Serial Monitor
-ESP32_PORT = 1234
 
 NUM_MATRICES   = 4      # number of chained 8×32 LED matrices (1-4 supported by Arduino code), MUST MATCH ARDUINO CODE
 MATRIX_HEIGHT  = 8       # rows per matrix, MUST MATCH ARDUINO CODE
@@ -23,10 +19,6 @@ GRID_ROWS = 8 * NUM_MATRICES
 
 BLOCK_SIZE = 20          # UI pixel size in the editor (px per cell)
 CHUNK_SIZE = 20
-
-# Wi-fi retry config
-MAX_RETRIES = 5
-RETRY_DELAY = 3
 
 root        = None
 brush_color = '#000000'
@@ -45,30 +37,6 @@ ser_lock = threading.Lock()
 dirty = False
 
 prev_leds = {}   # dict mapping pixel_index -> (R, G, B)
-
-# Wi-fi connection via socket wrapper to mimic serial.Serial interface (for ESP32 WiFi module)
-class WifiSerial:
-    def __init__(self, ip, port, timeout=2):
-        self._sock = socket.create_connection((ip, port), timeout=timeout)
-        self._sock.settimeout(timeout)
-        self.is_open = True
-
-    def write(self, data):
-        self._sock.sendall(data)
-
-    def read(self, n):
-        buf = b''
-        while len(buf) < n:
-            chunk = self._sock.recv(n - len(buf))
-            if not chunk:
-                raise ConnectionError("ESP32 disconnected")
-            buf += chunk
-        return buf
-
-    def close(self):
-        self._sock.close()
-        self.is_open = False
-
 
 # Color helpers
 
@@ -222,12 +190,7 @@ def flood_fill(xi, yi):
         visited.add((x, y))
         stack.extend([(x+1,y),(x-1,y),(x,y+1),(x,y-1)])
     for x, y in visited:
-        x0, y0 = x * BLOCK_SIZE, y * BLOCK_SIZE
-        draw_img.rectangle([(x0, y0), (x0+BLOCK_SIZE-1, y0+BLOCK_SIZE-1)], fill=(*fill_rgb, 255))
-    
-    global dirty
-    dirty = True
-    redraw_canvas()
+        paint_pixel(x, y, brush_color)
 
 def set_tool(tool_name):
     global current_tool
@@ -275,7 +238,7 @@ def _send_blackout():
 
 
 def open_image():
-    global image, draw_img, dirty
+    global image, draw_img
     path = filedialog.askopenfilename(
         filetypes=[('PNG files', '*.png'), ('All files', '*.*')])
     if path:
@@ -283,8 +246,6 @@ def open_image():
         image    = img.resize((GRID_COLS * BLOCK_SIZE, GRID_ROWS * BLOCK_SIZE),
                                Image.NEAREST)
         draw_img = ImageDraw.Draw(image)
-        prev_leds.clear()
-        dirty = True
         redraw_canvas()
 
 def save_image():
@@ -332,56 +293,43 @@ def _build_frame():
 
 
 # Send a pre-built delta packet in chunks, waiting for ACK each time.
-def _send_frame(frame_pkt):
+def _send_frame_chunked(frame_pkt):
+    total_pixels = (frame_pkt[2] << 8) | frame_pkt[3]
+    pixel_data = frame_pkt[4:]
+    
+
     with ser_lock:
-        ser.write(frame_pkt)
-        ack = ser.read(1)
-        if ack != b'K':
-            raise Exception('No ACK received')
+        for i in range(0, total_pixels, CHUNK_SIZE):
+            chunk_pixels = pixel_data[i*5 : (i+CHUNK_SIZE)*5]
+            count = len(chunk_pixels) // 5
+            pkt = bytearray([0xFF, 0xFE, (count >> 8) & 0xFF, count & 0xFF])
+            pkt.extend(chunk_pixels)
+            ser.write(pkt)
+            ack = ser.read(1)
+            if ack != b'K':
+                raise Exception(f'No ACK at chunk offset {i}')
 
 def _serial_sender():
     global dirty, ser
     while True:
         time.sleep(1 / 30)
-        if not ser or not ser.is_open:
-            continue
-        if dirty:
+        if ser and ser.is_open and dirty:
             dirty = False
             frame = _build_frame()
             if frame is None:
                 continue
             try:
-                _send_frame(frame)
+                _send_frame_chunked(frame)
             except Exception as e:
                 print(f'Send error: {e}')
                 ser = None
                 root.after(0, lambda err=e: _set_status('error', f'Lost connection: {err}'))
-                # Auto-reconnect in background
-                root.after(0, lambda: connect_btn.config(text='Connect'))
-                threading.Thread(target=_connect_wifi, daemon=True).start()
 
 def _refresh_ports():
     ports = [p.device for p in serial.tools.list_ports.comports()]
     port_combo['values'] = ports
     if ports and not port_var.get():
         port_combo.current(0)
-
-def _connect_wifi(retries=MAX_RETRIES):
-    global ser
-    for attempt in range(1, retries + 1):
-        try:
-            _set_status('off', f'Connecting... (attempt {attempt}/{retries})')
-            ser = WifiSerial(ESP32_IP, ESP32_PORT, timeout=5)
-            _set_status('ok', f'Connected  {ESP32_IP}:{ESP32_PORT}')
-            connect_btn.config(text='Disconnect')
-            return True
-        except Exception as e:
-            ser = None
-            if attempt < retries:
-                time.sleep(RETRY_DELAY)
-    _set_status('error', f'Failed after {retries} attempts')
-    connect_btn.config(text='Connect')
-    return False
 
 def _toggle_connect():
     global ser
@@ -391,8 +339,19 @@ def _toggle_connect():
         _set_status('off', 'Disconnected')
         connect_btn.config(text='Connect')
     else:
-        # Run in a thread so the UI doesn't freeze during retries
-        threading.Thread(target=_connect_wifi, daemon=True).start()
+        port = port_var.get()
+        if not port:
+            _set_status('error', 'No port selected')
+            return
+        try:
+            ser = serial.Serial(port, BAUD_RATE, timeout=2)
+            time.sleep(3)           # wait for Arduino reset
+            ser.reset_input_buffer()
+            ser.reset_output_buffer()
+            _set_status('ok', f'Connected  {port}')
+            connect_btn.config(text='Disconnect')
+        except Exception as e:
+            _set_status('error', str(e))
 
 def _set_status(state, text):
     colors = {'ok': 'green', 'error': 'red', 'off': 'gray'}
