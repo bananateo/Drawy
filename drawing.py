@@ -238,14 +238,13 @@ def set_tool(tool_name):
 
 def new_image():
     global image, draw_img, dirty
-    prev_leds.clear()
     image = Image.new('RGBA',
                 (GRID_COLS * BLOCK_SIZE, GRID_ROWS * BLOCK_SIZE),
                 (0, 0, 0, 255))
     draw_img = ImageDraw.Draw(image)
+    prev_leds.clear()
     dirty = True
     redraw_canvas()
-    _send_blackout()
 
 
 # Forces all LEDs to turn off

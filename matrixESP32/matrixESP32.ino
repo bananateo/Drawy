@@ -20,7 +20,6 @@ WiFiClient client;
 
 CRGB leds[TOTAL_LEDS];
 
-bool needsShow = false;
 unsigned long lastShowTime = 0;
 #define SHOW_INTERVAL_MS 33
 
@@ -40,9 +39,13 @@ bool readBytes(uint8_t* dst, int n) {
   unsigned long timeout = millis() + 5000;
   int received = 0;
   while (received < n) {
-    if (millis() > timeout) return false;
-    if (client.available()) {
-      dst[received++] = client.read();
+    int avail = client.available();
+    if (avail > 0) {
+      int toRead = min(avail, n - received);
+      client.read(dst + received, toRead);
+      received += toRead;
+    } else if (millis() > timeout) {
+      return false;
     } else {
       yield();
     }
@@ -112,13 +115,6 @@ void loop()
     }
   }
 
-  if (needsShow && millis() - lastShowTime >= SHOW_INTERVAL_MS) 
-  {
-    FastLED.show();
-    needsShow = false;
-    lastShowTime = millis();
-  }
-
   if (client.available() < 2) return;
 
   uint8_t a = client.read();
@@ -149,6 +145,13 @@ void loop()
     leds[getLEDIndex(matrixIndex, localCol, row)] = CRGB(chunk[2], chunk[3], chunk[4]);
   }
 
-  needsShow = true;
+  // ACK first — Python can queue the next frame while we do show()
   client.write('K');
+
+  // Now safe to call show(): no receive in progress, interrupts won't drop bytes
+  if (millis() - lastShowTime >= SHOW_INTERVAL_MS)
+  {
+    FastLED.show();
+    lastShowTime = millis();
+  }
 }
