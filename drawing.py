@@ -238,7 +238,7 @@ def _send_blackout():
 
 
 def open_image():
-    global image, draw_img
+    global image, draw_img, dirty
     path = filedialog.askopenfilename(
         filetypes=[('PNG files', '*.png'), ('All files', '*.*')])
     if path:
@@ -246,6 +246,7 @@ def open_image():
         image    = img.resize((GRID_COLS * BLOCK_SIZE, GRID_ROWS * BLOCK_SIZE),
                                Image.NEAREST)
         draw_img = ImageDraw.Draw(image)
+        dirty = True
         redraw_canvas()
 
 def save_image():
