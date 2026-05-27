@@ -353,6 +353,7 @@ def _toggle_connect():
             connect_btn.config(text='Disconnect')
         except Exception as e:
             _set_status('error', str(e))
+            # print(f'Connection error: {e}')
 
 def _set_status(state, text):
     colors = {'ok': 'green', 'error': 'red', 'off': 'gray'}
