@@ -29,6 +29,7 @@ WiFiClient client;
 CRGB leds[TOTAL_LEDS];
 
 unsigned long lastShowTime = 0;
+bool needsShow = false;
 #define SHOW_INTERVAL_MS 33
 
 // Serpentine + every-other-panel-rotated-180 mapping
@@ -84,6 +85,13 @@ void setup() {
 }
 
 void loop() {
+  if (needsShow && millis() - lastShowTime >= SHOW_INTERVAL_MS) {
+    FastLED.show();
+    needsShow = false;
+    lastShowTime = millis();
+  }
+
+
   // Keep a single TCP client.
   if (!client || !client.connected()) {
     WiFiClient incoming = server.accept();
@@ -110,7 +118,7 @@ void loop() {
     uint8_t val;
     if (!readBytes(src, &val, 1)) return;
     FastLED.setBrightness(val);
-    FastLED.show();
+    needsShow = true;
     src->write('K');
     return;
   }
@@ -142,8 +150,5 @@ void loop() {
 
   src->write('K');   // ACK first so the app can queue the next frame
 
-  if (millis() - lastShowTime >= SHOW_INTERVAL_MS) {
-    FastLED.show();
-    lastShowTime = millis();
-  }
+  needsShow = true;  // actual show() is handled by the deferred refresh above
 }
