@@ -1,18 +1,26 @@
 #include <FastLED.h>
 #include <WiFi.h>
-#include "../secrets.h"
 
+//  Drawy firmware — unified transport (Wi-Fi SoftAP + USB serial fallback)
+//  and runtime LED-brightness control for the 4-matrix RGB LED panel
+
+//  These MUST match drawing.py:
 #define NUM_MATRICES   4
 #define MATRIX_WIDTH   32
 #define MATRIX_HEIGHT  8
 #define TOTAL_LEDS     (NUM_MATRICES * MATRIX_WIDTH * MATRIX_HEIGHT)
 #define DATA_PIN       13
 
-#define HEADER_A 0xFF
-#define HEADER_B 0xFE
+// Protocol
+#define HEADER_A        0xFF
+#define HEADER_B        0xFE   // pixel frame:  FF FE [count hi][count lo] [idx idx R G B]...
+#define HEADER_BRIGHT   0xFD   // brightness :  FF FD [value 0-255]
 
-// Wi-Fi config
-// Password and network name are in secrets.h
+//  Access point (the ESP32 creates its OWN network)
+//  Join this network from the laptop, then point the app at 192.168.4.1.
+//  AP password must be at least 8 characters for WPA2.
+const char*    AP_SSID  = "Drawy";
+const char*    AP_PASS  = "drawy1234";
 const uint16_t TCP_PORT = 1234;
 
 WiFiServer server(TCP_PORT);
@@ -20,29 +28,34 @@ WiFiClient client;
 
 CRGB leds[TOTAL_LEDS];
 
-bool needsShow = false;
 unsigned long lastShowTime = 0;
+bool needsShow = false;
 #define SHOW_INTERVAL_MS 33
 
+// Serpentine + every-other-panel-rotated-180 mapping
 int getLEDIndex(int matrixIndex, int col, int row) {
   int base = matrixIndex * MATRIX_WIDTH * MATRIX_HEIGHT;
   bool flipped = (matrixIndex % 2 != 0);
-  int effectiveCol = flipped ? (MATRIX_WIDTH - 1 - col) : col;
+  int effectiveCol = flipped ? (MATRIX_WIDTH  - 1 - col) : col;
   int effectiveRow = flipped ? (MATRIX_HEIGHT - 1 - row) : row;
-  if (effectiveCol % 2 == 0) {
+  if (effectiveCol % 2 == 0)
     return base + effectiveCol * MATRIX_HEIGHT + effectiveRow;
-  } else {
+  else
     return base + effectiveCol * MATRIX_HEIGHT + (MATRIX_HEIGHT - 1 - effectiveRow);
-  }
 }
 
-bool readBytes(uint8_t* dst, int n) {
-  unsigned long timeout = millis() + 5000;
+// Read exactly n bytes from whichever transport we were handed (Serial or TCP).
+// Both derive from Stream, so the same code works for cable and Wi-Fi.
+bool readBytes(Stream* s, uint8_t* dst, int n) {
+  unsigned long timeout = millis() + 3000;
   int received = 0;
   while (received < n) {
-    if (millis() > timeout) return false;
-    if (client.available()) {
-      dst[received++] = client.read();
+    int avail = s->available();
+    if (avail > 0) {
+      int toRead = min(avail, n - received);
+      received += s->readBytes(dst + received, toRead);
+    } else if (millis() > timeout) {
+      return false;
     } else {
       yield();
     }
@@ -52,91 +65,77 @@ bool readBytes(uint8_t* dst, int n) {
 
 void setup() {
   FastLED.addLeds<WS2812B, DATA_PIN, GRB>(leds, TOTAL_LEDS);
-  FastLED.setBrightness(50);
+  FastLED.setBrightness(50);        // starting value; app can change it live
   FastLED.clear();
   FastLED.show();
-  
-  Serial.begin(115200); // Now used for debug
 
-  IPAddress staticIP(10, 180, 227, 110);
-  IPAddress gateway(10, 180, 227, 1);
-  IPAddress subnet(255, 255, 255, 0);
-  IPAddress dns(8, 8, 8, 8);
+  Serial.begin(500000);             // doubles as the cable transport
 
-  WiFi.config(staticIP, gateway, subnet, dns);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  WiFi.mode(WIFI_AP);
+  WiFi.setSleep(false);             // steadier link, lower latency
+  WiFi.softAP(AP_SSID, AP_PASS);
 
-  Serial.print("Connecting to Wi-Fi");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println();
-  Serial.print("Connected! IP: ");
-  Serial.println(WiFi.localIP()); // see in Serial Monitor
+  // Setup-only debug. Avoid printing in loop() so cable transport stays clean.
+  Serial.print("AP \"");
+  Serial.print(AP_SSID);
+  Serial.print("\" up. Join it, then point the app at ");
+  Serial.println(WiFi.softAPIP());  // 192.168.4.1 by default
 
   server.begin();
-  Serial.print("TCP server listening on port ");
-  Serial.println(TCP_PORT);
 }
 
-void loop() 
-{
-  // reconnection logic
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("Wi-Fi lost, reconnecting...");
-    client.stop();
-    WiFi.disconnect();
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-    unsigned long t = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - t < 10000) {
-      delay(500);
-    }
-    if (WiFi.status() == WL_CONNECTED) {
-      Serial.println("Reconnected!");
-    }
-    return;
-  }
-  
-  // Accept a new client if none connected
-  if (!client || !client.connected()) 
-  {
-    client = server.accept();
-    if (client) 
-    {
-      client.setNoDelay(true);
-      Serial.println("Client connected");
-    } else 
-    {
-      return; // no client yet, nothing to do
-    }
-  }
-
-  if (needsShow && millis() - lastShowTime >= SHOW_INTERVAL_MS) 
-  {
+void loop() {
+  if (needsShow && millis() - lastShowTime >= SHOW_INTERVAL_MS) {
     FastLED.show();
     needsShow = false;
     lastShowTime = millis();
   }
 
-  if (client.available() < 2) return;
 
-  uint8_t a = client.read();
-  if (a != HEADER_A) return;
-  uint8_t b = client.read();
+  // Keep a single TCP client.
+  if (!client || !client.connected()) {
+    WiFiClient incoming = server.accept();
+    if (incoming) {
+      client = incoming;
+      client.setNoDelay(true);
+    }
+  }
+
+  // Choose a transport that has a header waiting: TCP first, cable as fallback.
+  Stream* src = nullptr;
+  if (client && client.connected() && client.available() >= 2)
+    src = &client;
+  else if (Serial.available() >= 2)
+    src = &Serial;
+
+  if (!src) return;
+
+  if (src->read() != HEADER_A) return;
+  uint8_t b = src->read();
+
+  // Brightness command
+  if (b == HEADER_BRIGHT) {
+    uint8_t val;
+    if (!readBytes(src, &val, 1)) return;
+    FastLED.setBrightness(val);
+    needsShow = true;
+    src->write('K');
+    return;
+  }
+
   if (b != HEADER_B) return;
 
-  uint8_t count_bytes[2];
-  if (!readBytes(count_bytes, 2)) return;
-  uint16_t count = ((uint16_t)count_bytes[0] << 8) | count_bytes[1];
+  // Pixel frame
+  uint8_t cb[2];
+  if (!readBytes(src, cb, 2)) return;
+  uint16_t count = ((uint16_t)cb[0] << 8) | cb[1];
   if (count > TOTAL_LEDS) return;
 
   int totalCols = NUM_MATRICES * MATRIX_WIDTH;
   uint8_t chunk[5];
 
-  for (uint16_t i = 0; i < count; i++) 
-  {
-    if (!readBytes(chunk, 5)) return;
+  for (uint16_t i = 0; i < count; i++) {
+    if (!readBytes(src, chunk, 5)) return;
 
     uint16_t pixelIndex = ((uint16_t)chunk[0] << 8) | chunk[1];
     if (pixelIndex >= TOTAL_LEDS) continue;
@@ -149,6 +148,7 @@ void loop()
     leds[getLEDIndex(matrixIndex, localCol, row)] = CRGB(chunk[2], chunk[3], chunk[4]);
   }
 
-  needsShow = true;
-  client.write('K');
-}
+  src->write('K');   // ACK first so the app can queue the next frame
+
+  needsShow = true;  // actual show() is handled by the deferred refresh above
+}
