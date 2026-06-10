@@ -95,10 +95,44 @@ The status indicator turns green when connected.
 
 ## Usage
 
-- **Tools:** Draw, Erase, Fill (flood fill), Clear.
-- **Color:** pick a hue/saturation from the color wheel; the **Color shade** slider sets the lightness of the brush color.
-- **LED brightness:** the **LED brightness** slider sets the physical panel brightness live (sent to the ESP32). This is separate from the color shade.
-- **File menu:** New, Open (load a PNG onto the grid), Save (export the grid as a PNG).
+### Tools
+
+| Tool | How to use |
+|------|------------|
+| **Draw** | Click or drag to paint pixels with the current brush color. |
+| **Erase** | Click or drag to set pixels back to black. |
+| **Fill** | Click a region to flood-fill it with the current brush color. |
+| **Pick** | Click any pixel to sample its color. The color wheel and shade slider jump to match, and the tool switches back to Draw automatically. |
+| **Clear** | Wipes the current frame to black. |
+
+### Color
+
+Pick a hue and saturation from the color wheel. The **Color shade** slider controls the lightness of the brush color. The **Current color** swatch always shows what you'll paint with. The **LED brightness** slider controls the physical panel brightness live (sent to the ESP32) - this is separate from the brush color.
+
+### Animation
+
+The app supports multi-frame animation. An animation bar sits below the drawing canvas:
+
+- **Add** — inserts a new blank frame after the current one.
+- **Duplicate** — copies the current frame.
+- **Delete** — removes the current frame (the last frame is cleared instead of deleted).
+- **Play / Stop** — plays the animation in a loop at the chosen FPS. The LED wall plays along in real time.
+- **FPS** — set the playback speed (1–30 fps).
+- **Frame strip** — a scrollable row of thumbnails below the controls. Click any thumbnail to jump to that frame. The current frame is highlighted.
+- **<- / ->** arrow keys also step through frames when a text field is not focused.
+
+### File menu
+
+| Item | Action |
+|------|--------|
+| New | Clears the animation back to a single blank frame. |
+| Open (PNG/GIF) | A still PNG loads into the **current frame** only. An animated GIF replaces the **entire animation**. |
+| Save frame (PNG) | Saves the current frame as a 32×32 PNG. |
+| Export GIF | Saves the whole animation as an animated GIF (upscaled ×8 for readability) at the current FPS. |
+
+### Resizing
+
+The window is freely resizable. The drawing grid scales to fill the available space and stays centered. The sidebar shows a scrollbar when the window is too short to display all controls at once; scroll or resize to reach anything that's off-screen.
 
 ## Configuration
 
