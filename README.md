@@ -1,26 +1,28 @@
 # Drawy
-Drawy is an embedded project that provides a platform for pixel drawing in a 32x32 grid. You can draw, select a color using a color wheel, and adjust the brightness of the colors. The program also allows you to save and load images. Via Wi-Fi, image information is transmitted in real time to an ESP32 that controls 4 8x32 LED matrices.
-![alt text](https://github.com/bananateo/Drawy/blob/main/imgs/cloud.jpg "A picture of a cloud on an LED matrix")
 
 An embedded project that lets you draw on a desktop app and displays the result in real time on a wall of WS2812B LED matrices.
 
-A Python painting application sends pixel data over Wi-Fi to an ESP32, which drives four chained 8×32 LED panels.
+A Python painting application sends pixel data to an ESP32 - over **Wi-Fi or a USB cable** - and the ESP32 drives four chained 8×32 LED panels.
+
+![A picture of a cloud on an LED matrix](https://github.com/bananateo/Drawy/blob/main/imgs/cloud.jpg "A picture of a cloud on an LED matrix")
 
 ## How it works
 
 ```
-Python app (tkinter)  ──Wi-Fi / TCP──>  ESP32 (FastLED)  ──data──>  4× WS2812B 8×32 panels
-   draw / erase / fill                  TCP server :1234            (1024 LEDs, 32×32 grid)
+Python app (tkinter)  ---Wi-Fi (TCP) or USB serial--->  ESP32 (FastLED)  ---data--->  4× WS2812B 8×32 panels
+   draw / erase / fill                                 listens on both              (1024 LEDs, 32×32 grid)
 ```
 
 You draw on a 32×32 grid in the app. Each frame, the app sends only the pixels that changed to the ESP32, which maps them to the physical LED layout and updates the matrices.
 
+The ESP32 runs as its own **Wi-Fi access point** (it creates a network called `Drawy`), so it works on any laptop anywhere with no router, no phone hotspot, and no per-network reconfiguration. A USB cable can be used instead, or as a fallback.
+
 ## Hardware
 
 - **4× WS2812B 8×32 LED panels** chained in series (DIN → DOUT), forming one 32×32 grid (1024 LEDs total).
-- **ESP32** microcontroller (data on pin **13**), connected over Wi-Fi.
-- **5V power supply** (purchased) powering both the LED matrices and the ESP32 (via its 5V pin).
-- No logic level shifter — the data line is driven directly from the ESP32's 3.3V output.
+- **ESP32** microcontroller (data on pin **13**).
+- **5V power supply** powering both the LED matrices and the ESP32 (via its 5V pin).
+- No logic level shifter — the data line is driven directly from the ESP32's output.
 
 Inside each panel the LEDs are wired in a **serpentine** pattern, and every second panel is mounted **rotated 180°**. The firmware's `getLEDIndex()` handles this mapping, so the app can send simple (column, row) coordinates.
 
@@ -28,31 +30,42 @@ Inside each panel the LEDs are wired in a **serpentine** pattern, and every seco
 
 | File | Role |
 |------|------|
-| `drawing.py` | Desktop painting app (Python, `tkinter` + `Pillow`). Draws, sends frames over Wi-Fi. |
-| `matrixESP32.ino` | ESP32 firmware (`FastLED` + `WiFi`). TCP server that receives frames and drives the LEDs. |
+| `drawing.py` | Desktop painting app (Python, `tkinter` + `Pillow`) |
+| `matrixESP32.ino` | ESP32 firmware (`FastLED` + `WiFi`) |
+
+A single app and a single firmware handle both Wi-Fi and cable - there are no separate wired/wireless versions.
 
 ### Communication protocol
 
-The app sends only changed pixels (delta updates) for speed (~30 fps). Each packet:
+The app sends only changed pixels (delta updates) for speed (~30 fps). Two packet types share the same `0xFF` lead byte:
+
+**Pixel frame**
 
 - `0xFF 0xFE` — header
 - 2 bytes — number of changed pixels
 - per pixel: 2 bytes index + 1 byte each R, G, B
 
-The ESP32 replies with a single byte `'K'` (ACK) after processing, then the app sends the next frame. The app auto-reconnects if the connection drops.
+**Brightness command** (sets the LED panel brightness live)
+
+- `0xFF 0xFD` — header
+- 1 byte — brightness, `0`–`255`
+
+The ESP32 replies with a single byte `'K'` (ACK) after processing each packet, then the app sends the next one. On Wi-Fi the app auto-reconnects if the connection drops.
+
+Large frames are sent in small chunks (each a self-contained pixel frame). The firmware accumulates them into its LED buffer and refreshes the panels at a rate-limited ~30 fps, always displaying the final state of a burst.
 
 ## Setup
 
 ### ESP32 (firmware)
 
 1. Install the [FastLED](https://github.com/FastLED/FastLED) library in the Arduino IDE.
-2. Create a `secrets.h` file (one directory above the sketch) with your Wi-Fi credentials:
+2. *(Optional)* Change the access-point name/password near the top of the sketch:
    ```cpp
-   #define WIFI_SSID     "your-network"
-   #define WIFI_PASSWORD "your-password"
+   const char* AP_SSID = "Drawy";
+   const char* AP_PASS = "drawy1234";   // must be at least 8 characters
    ```
-3. Adjust the static IP in `setup()` if needed, then flash the ESP32.
-4. Open the Serial Monitor (115200 baud) to confirm the assigned IP address.
+3. Flash the ESP32.
+4. *(Optional)* Open the Serial Monitor at **500000 baud** to see the access-point address (defaults to `192.168.4.1`).
 
 ### Python app
 
@@ -61,17 +74,30 @@ The ESP32 replies with a single byte `'K'` (ACK) after processing, then the app 
    pip install pillow pyserial
    ```
    (`tkinter` ships with Python.)
-2. In `drawing.py`, set `ESP32_IP` to the IP shown in the Serial Monitor.
-3. Run it:
+2. Run it:
    ```bash
    python drawing.py
    ```
-4. Click **Connect**. The status indicator turns green when connected.
+
+### Connecting
+
+**Wi-Fi (default):**
+
+1. On the laptop, join the **`Drawy`** Wi-Fi network (password `drawy1234`). The laptop loses internet while joined, since it's on the ESP32's private network.
+2. In the app, leave the transport on **Wi-Fi** (IP defaults to `192.168.4.1`) and click **Connect**.
+
+**Cable:**
+
+1. Plug the ESP32 in over USB.
+2. In the app, switch the transport to **Cable**, pick the COM port, and click **Connect**.
+
+The status indicator turns green when connected.
 
 ## Usage
 
 - **Tools:** Draw, Erase, Fill (flood fill), Clear.
-- **Color:** pick a hue/saturation from the color wheel; adjust the Brightness slider.
+- **Color:** pick a hue/saturation from the color wheel; the **Color shade** slider sets the lightness of the brush color.
+- **LED brightness:** the **LED brightness** slider sets the physical panel brightness live (sent to the ESP32). This is separate from the color shade.
 - **File menu:** New, Open (load a PNG onto the grid), Save (export the grid as a PNG).
 
 ## Configuration
@@ -83,7 +109,6 @@ These must match between the app and the firmware, or the image will map incorre
 | Number of panels | `NUM_MATRICES` | `NUM_MATRICES` |
 | Panel height | `MATRIX_HEIGHT` | `MATRIX_HEIGHT` |
 | Panel width | `GRID_COLS` (32) | `MATRIX_WIDTH` |
-| ESP32 address | `ESP32_IP` / `ESP32_PORT` | static IP / `TCP_PORT` |
+| Wi-Fi address | `ESP32_IP` / `ESP32_PORT` | `AP_SSID` / `AP_PASS` / `TCP_PORT` |
 
-LED brightness is set in the firmware via `FastLED.setBrightness(50)`.
->>>>>>> Stashed changes
+The starting LED brightness is set in the firmware via `FastLED.setBrightness(50)` and can then be changed live from the app.
