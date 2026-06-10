@@ -1,6 +1,6 @@
 import tkinter as tk
-from tkinter import filedialog
-from PIL import Image, ImageDraw
+from tkinter import filedialog, ttk
+from PIL import Image, ImageDraw, ImageTk, ImageSequence
 import math
 import serial
 import serial.tools.list_ports
@@ -21,7 +21,13 @@ BAUD_RATE     = 500000
 GRID_COLS = 32
 GRID_ROWS = 8 * NUM_MATRICES
 
-BLOCK_SIZE = 20
+# The canvas zoom (pixels per grid cell) is now DYNAMIC: it is recomputed
+# whenever the window is resized, so the whole app scales like any normal
+# window. Frames are stored at native grid resolution (32x32), independent
+# of how big they are drawn on screen.
+MIN_CELL  = 6        # don't let cells get smaller than this
+cell_size = 20       # current zoom; updated on window resize
+
 CHUNK_SIZE = 20
 
 MAX_RETRIES = 5
@@ -51,6 +57,20 @@ ser_lock = threading.Lock()
 dirty    = False
 
 prev_leds = {}   # pixel_index -> (R, G, B)
+
+# Animation state
+frames        = []      # list of native-resolution PIL Images
+current_frame = 0
+is_playing    = False
+play_job      = None    # root.after() id while playing
+
+THUMB_W = 48
+THUMB_H = max(1, int(THUMB_W * GRID_ROWS / GRID_COLS))
+
+thumb_refs    = []      # keep PhotoImage references alive
+thumb_buttons = []
+canvas_rects  = []      # one canvas rectangle per grid cell, created once
+_resize_job   = None    # debounce id for window-resize events
 
 
 # Wi-Fi socket wrapper that mimics serial.Serial
@@ -99,6 +119,22 @@ def hsl_to_rgb(h, s, l):
     elif h < 300: r, g, b = x, 0, c
     else:         r, g, b = c, 0, x
     return int((r + m) * 255), int((g + m) * 255), int((b + m) * 255)
+
+
+def rgb_to_hsl(r, g, b):
+    # Inverse of hsl_to_rgb, used by the eyedropper so the wheel + shade
+    # slider jump to the picked color.
+    r, g, b = r / 255, g / 255, b / 255
+    mx, mn = max(r, g, b), min(r, g, b)
+    l = (mx + mn) / 2
+    if mx == mn:
+        return 0.0, 0.0, l * 100
+    d = mx - mn
+    s = d / (1 - abs(2 * l - 1))
+    if   mx == r: h = ((g - b) / d) % 6
+    elif mx == g: h = (b - r) / d + 2
+    else:         h = (r - g) / d + 4
+    return h * 60, min(s, 1.0) * 100, l * 100
 
 
 def rgb_to_hex(r, g, b):
@@ -175,57 +211,114 @@ def on_shade_change(val):
 
 
 # Canvas / drawing
-def redraw_canvas():
-    canvas.config(width=GRID_COLS * BLOCK_SIZE, height=GRID_ROWS * BLOCK_SIZE)
+def _init_canvas_cells():
+    # Create every grid cell ONCE; redraws just recolor them and window
+    # resizes just move/scale them. This keeps everything fast.
+    canvas.config(width=GRID_COLS * cell_size, height=GRID_ROWS * cell_size)
     canvas.delete('all')
+    canvas_rects.clear()
     for y in range(GRID_ROWS):
         for x in range(GRID_COLS):
-            x0, y0 = x * BLOCK_SIZE, y * BLOCK_SIZE
-            color = image.getpixel((x0, y0))
-            hex_color = '#{:02x}{:02x}{:02x}'.format(*color[:3])
-            canvas.create_rectangle(x0, y0, x0+BLOCK_SIZE, y0+BLOCK_SIZE,
-                                    fill=hex_color, outline='#333333', width=1)
+            x0, y0 = x * cell_size, y * cell_size
+            rid = canvas.create_rectangle(x0, y0, x0+cell_size, y0+cell_size,
+                                          fill='#000000', outline='#333333',
+                                          width=1)
+            canvas_rects.append(rid)
+
+
+def redraw_canvas():
+    for y in range(GRID_ROWS):
+        for x in range(GRID_COLS):
+            color = image.getpixel((x, y))
+            canvas.itemconfig(canvas_rects[y * GRID_COLS + x],
+                              fill='#{:02x}{:02x}{:02x}'.format(*color[:3]))
+
+
+# Window resizing: pick the biggest cell size that fits, then move the
+# existing rectangles. Debounced so dragging the window edge stays smooth.
+def _on_canvas_area_resize(event=None):
+    global _resize_job
+    if _resize_job is not None:
+        root.after_cancel(_resize_job)
+    _resize_job = root.after(60, _apply_canvas_size)
+
+
+def _apply_canvas_size():
+    global cell_size, _resize_job
+    _resize_job = None
+    w = canvas_frame.winfo_width()  - 4
+    h = canvas_frame.winfo_height() - 4
+    if w <= 0 or h <= 0:
+        return
+    cell = max(MIN_CELL, min(w // GRID_COLS, h // GRID_ROWS))
+    if cell == cell_size:
+        return
+    cell_size = cell
+    canvas.config(width=GRID_COLS * cell, height=GRID_ROWS * cell)
+    for y in range(GRID_ROWS):
+        for x in range(GRID_COLS):
+            rid = canvas_rects[y * GRID_COLS + x]
+            canvas.coords(rid, x * cell, y * cell,
+                          (x + 1) * cell, (y + 1) * cell)
 
 
 def start_paint(event):
     global is_painting
+    if is_playing:
+        _stop_playback()
     is_painting = True
     apply_tool(event)
 
 
 def stop_paint(event):
     global is_painting
+    if is_painting and current_tool in ('draw', 'erase'):
+        _refresh_current_thumb()
     is_painting = False
 
 
 def on_motion(event):
-    if is_painting and current_tool != 'fill':
+    if is_painting and current_tool in ('draw', 'erase'):
         apply_tool(event)
 
 
 def apply_tool(event):
-    xi = event.x // BLOCK_SIZE
-    yi = event.y // BLOCK_SIZE
+    xi = event.x // cell_size
+    yi = event.y // cell_size
     if not (0 <= xi < GRID_COLS and 0 <= yi < GRID_ROWS):
         return
     if   current_tool == 'draw':  paint_pixel(xi, yi, brush_color)
     elif current_tool == 'erase': paint_pixel(xi, yi, '#000000')
     elif current_tool == 'fill':  flood_fill(xi, yi)
+    elif current_tool == 'pick':  pick_canvas_color(xi, yi)
 
 
 def paint_pixel(xi, yi, color):
     global dirty
-    x0, y0 = xi * BLOCK_SIZE, yi * BLOCK_SIZE
-    x1, y1 = x0 + BLOCK_SIZE - 1, y0 + BLOCK_SIZE - 1
     rgb = hex_to_rgb(color)
-    draw_img.rectangle([(x0, y0), (x1, y1)], fill=(*rgb, 255))
-    canvas.create_rectangle(x0, y0, x0 + BLOCK_SIZE, y0 + BLOCK_SIZE,
-                            fill=color, outline='#333333', width=1)
+    image.putpixel((xi, yi), (*rgb, 255))
+    canvas.itemconfig(canvas_rects[yi * GRID_COLS + xi], fill=color)
     dirty = True
 
 
+# Eyedropper: grab the color under the cursor, sync the wheel + shade
+# slider to it, then hop back to the Draw tool.
+def pick_canvas_color(xi, yi):
+    global hue, saturation, shade, is_painting
+    rgb = image.getpixel((xi, yi))[:3]
+    h, s, l = rgb_to_hsl(*rgb)
+    hue        = h
+    saturation = s / 100
+    shade      = 1 - l / 100
+    shade_slider.set(shade)        # keep the slider in sync
+    _update_brush_color()
+    draw_color_wheel()
+    is_painting = False            # don't start drawing on the same drag
+    set_tool('draw')
+
+
 def flood_fill(xi, yi):
-    target   = image.getpixel((xi * BLOCK_SIZE, yi * BLOCK_SIZE))[:3]
+    target   = image.getpixel((xi, yi))[:3]
     fill_rgb = hex_to_rgb(brush_color)
     if target == fill_rgb:
         return
@@ -234,17 +327,16 @@ def flood_fill(xi, yi):
         x, y = stack.pop()
         if (x, y) in visited or not (0 <= x < GRID_COLS and 0 <= y < GRID_ROWS):
             continue
-        if image.getpixel((x * BLOCK_SIZE, y * BLOCK_SIZE))[:3] != target:
+        if image.getpixel((x, y))[:3] != target:
             continue
         visited.add((x, y))
         stack.extend([(x+1,y),(x-1,y),(x,y+1),(x,y-1)])
     for x, y in visited:
-        x0, y0 = x * BLOCK_SIZE, y * BLOCK_SIZE
-        draw_img.rectangle([(x0, y0), (x0+BLOCK_SIZE-1, y0+BLOCK_SIZE-1)],
-                           fill=(*fill_rgb, 255))
+        image.putpixel((x, y), (*fill_rgb, 255))
     global dirty
     dirty = True
     redraw_canvas()
+    _refresh_current_thumb()
 
 
 def set_tool(tool_name):
@@ -255,15 +347,193 @@ def set_tool(tool_name):
                    bg='#dde'     if name == tool_name else '#f0f0f0')
 
 
-def new_image():
-    global image, draw_img, dirty
-    image = Image.new('RGBA',
-                      (GRID_COLS * BLOCK_SIZE, GRID_ROWS * BLOCK_SIZE),
-                      (0, 0, 0, 255))
+# Animation: frames (stored at native grid resolution)
+def _new_blank_frame():
+    return Image.new('RGBA', (GRID_COLS, GRID_ROWS), (0, 0, 0, 255))
+
+
+def _select_frame(idx, rebuild=False):
+    """Make frames[idx] the one shown on the canvas (and on the LEDs)."""
+    global current_frame, image, draw_img, dirty
+    current_frame = idx
+    image    = frames[idx]
     draw_img = ImageDraw.Draw(image)
-    prev_leds.clear()
+    redraw_canvas()
+    if rebuild:
+        _rebuild_frame_strip()
+    else:
+        _update_strip_selection()
+    dirty = True     # the LED panel always shows the selected frame
+
+
+def add_frame():
+    _stop_playback()
+    frames.insert(current_frame + 1, _new_blank_frame())
+    _select_frame(current_frame + 1, rebuild=True)
+
+
+def duplicate_frame():
+    _stop_playback()
+    frames.insert(current_frame + 1, frames[current_frame].copy())
+    _select_frame(current_frame + 1, rebuild=True)
+
+
+def delete_frame():
+    _stop_playback()
+    if len(frames) == 1:
+        clear_frame()            # deleting the last frame just clears it
+        return
+    frames.pop(current_frame)
+    _select_frame(min(current_frame, len(frames) - 1), rebuild=True)
+
+
+def clear_frame():
+    global dirty
+    _stop_playback()
+    draw_img.rectangle([(0, 0), (GRID_COLS - 1, GRID_ROWS - 1)],
+                       fill=(0, 0, 0, 255))
     dirty = True
     redraw_canvas()
+    _refresh_current_thumb()
+
+
+def _step_frame(delta):
+    w = root.focus_get()
+    if isinstance(w, (tk.Entry, tk.Spinbox, ttk.Combobox)):
+        return                   # don't steal arrow keys from text fields
+    _stop_playback()
+    _select_frame((current_frame + delta) % len(frames))
+
+
+# Animation: frame strip UI
+def _rebuild_frame_strip():
+    for w in strip_inner.winfo_children():
+        w.destroy()
+    thumb_refs.clear()
+    thumb_buttons.clear()
+    for i, f in enumerate(frames):
+        ph = ImageTk.PhotoImage(f.resize((THUMB_W, THUMB_H), Image.NEAREST))
+        thumb_refs.append(ph)
+        btn = tk.Button(strip_inner, image=ph, text=str(i + 1),
+                        compound='top', font=('TkDefaultFont', 8), bd=1,
+                        command=lambda i=i: (_stop_playback(),
+                                             _select_frame(i)))
+        btn.pack(side='left', padx=2, pady=2)
+        thumb_buttons.append(btn)
+    _update_strip_selection()
+    strip_inner.update_idletasks()
+    strip_canvas.config(scrollregion=strip_canvas.bbox('all') or (0, 0, 0, 0))
+
+
+def _update_strip_selection():
+    for i, btn in enumerate(thumb_buttons):
+        sel = (i == current_frame)
+        btn.config(bg='#cde' if sel else '#f0f0f0',
+                   relief='sunken' if sel else 'raised')
+    frame_pos_lbl.config(text=f'Frame {current_frame + 1} / {len(frames)}')
+
+
+def _refresh_current_thumb():
+    if current_frame < len(thumb_buttons):
+        ph = ImageTk.PhotoImage(
+            frames[current_frame].resize((THUMB_W, THUMB_H), Image.NEAREST))
+        thumb_refs[current_frame] = ph
+        thumb_buttons[current_frame].config(image=ph)
+
+
+# Animation: playback (the LED wall plays along, since selecting a frame
+# marks it dirty and the sender thread pushes the delta)
+def _toggle_play():
+    global is_playing
+    if is_playing:
+        _stop_playback()
+        return
+    if len(frames) < 2:
+        return
+    is_playing = True
+    play_btn.config(text='\u25a0 Stop')
+    _play_step()
+
+
+def _play_step():
+    global play_job
+    if not is_playing:
+        return
+    _select_frame((current_frame + 1) % len(frames))
+    delay = max(20, int(1000 / max(1, _get_fps())))
+    play_job = root.after(delay, _play_step)
+
+
+def _stop_playback():
+    global is_playing, play_job
+    is_playing = False
+    if play_job is not None:
+        root.after_cancel(play_job)
+        play_job = None
+    if play_btn is not None:
+        play_btn.config(text='\u25b6 Play')
+
+
+def _get_fps():
+    try:
+        return max(1, min(30, int(fps_var.get())))
+    except Exception:
+        return 8
+
+
+# File menu
+def new_animation():
+    global frames
+    _stop_playback()
+    frames[:] = [_new_blank_frame()]
+    prev_leds.clear()
+    _select_frame(0, rebuild=True)
+
+
+def open_image():
+    global frames
+    path = filedialog.askopenfilename(
+        filetypes=[('Images', '*.png *.gif'),
+                   ('PNG files', '*.png'),
+                   ('GIF files', '*.gif'),
+                   ('All files', '*.*')])
+    if not path:
+        return
+    _stop_playback()
+    img  = Image.open(path)
+    size = (GRID_COLS, GRID_ROWS)
+    if getattr(img, 'n_frames', 1) > 1:
+        # Animated GIF -> replaces the whole animation
+        frames[:] = [f.convert('RGBA').resize(size, Image.NEAREST)
+                     for f in ImageSequence.Iterator(img)]
+        prev_leds.clear()
+        _select_frame(0, rebuild=True)
+    else:
+        # Still image -> loads into the CURRENT frame only
+        frames[current_frame] = img.convert('RGBA').resize(size, Image.NEAREST)
+        _select_frame(current_frame, rebuild=True)
+
+
+def save_image():
+    path = filedialog.asksaveasfilename(
+        defaultextension='.png',
+        filetypes=[('PNG files', '*.png'), ('All files', '*.*')])
+    if path:
+        image.save(path)
+
+
+def export_gif():
+    path = filedialog.asksaveasfilename(
+        defaultextension='.gif',
+        filetypes=[('GIF files', '*.gif'), ('All files', '*.*')])
+    if not path:
+        return
+    scale = 8   # upscale so the GIF is viewable; Open re-downscales fine
+    out = [f.resize((GRID_COLS * scale, GRID_ROWS * scale), Image.NEAREST)
+            .convert('RGB')
+           for f in frames]
+    out[0].save(path, save_all=True, append_images=out[1:],
+                duration=int(1000 / _get_fps()), loop=0)
 
 
 # Forces all LEDs to turn off
@@ -288,27 +558,6 @@ def _send_blackout():
             _set_status('ok', 'Cleared')
         except Exception as e:
             _set_status('error', f'Blackout failed: {e}')
-
-
-def open_image():
-    global image, draw_img, dirty
-    path = filedialog.askopenfilename(
-        filetypes=[('PNG files', '*.png'), ('All files', '*.*')])
-    if path:
-        img      = Image.open(path).convert('RGBA')
-        image    = img.resize((GRID_COLS * BLOCK_SIZE, GRID_ROWS * BLOCK_SIZE),
-                              Image.NEAREST)
-        draw_img = ImageDraw.Draw(image)
-        prev_leds.clear()
-        dirty = True
-        redraw_canvas()
-
-def save_image():
-    path = filedialog.asksaveasfilename(
-        defaultextension='.png',
-        filetypes=[('PNG files', '*.png'), ('All files', '*.*')])
-    if path:
-        image.resize((GRID_COLS, GRID_ROWS), Image.NEAREST).save(path)
 
 
 # LED panel brightness (separate from color shade) -> sent to the ESP32
@@ -341,7 +590,7 @@ def _build_frame():
             physical_col  = matrix_index * GRID_COLS + canvas_col  # col across full strip
             pixel_index = local_row * PHYSICAL_COLS + physical_col
 
-            px  = image.getpixel((canvas_col * BLOCK_SIZE, canvas_row * BLOCK_SIZE))
+            px  = image.getpixel((canvas_col, canvas_row))
             rgb = (px[0], px[1], px[2])
             if prev_leds.get(pixel_index) != rgb:
                 changed.append((pixel_index, rgb))
@@ -471,36 +720,90 @@ def _on_transport_change():
 
 # UI
 def setup_app():
-    global root, image, draw_img, canvas, wheel_canvas, color_preview
-    global shade_slider, led_brightness_slider, tool_buttons
+    global root, image, draw_img, canvas, canvas_frame, wheel_canvas
+    global color_preview, shade_slider, led_brightness_slider, tool_buttons
     global port_var, port_combo, connect_btn, status_lbl
     global transport_var, transport_frame, wifi_frame, cable_frame
     global ip_var, port_num_var
+    global play_btn, fps_var, frame_pos_lbl, strip_canvas, strip_inner
 
     root = tk.Tk()
     root.title(f'Drawy  —  {GRID_COLS}x{GRID_ROWS}  ({NUM_MATRICES} panels)')
-    root.resizable(False, False)
 
-    image    = Image.new('RGBA',
-                         (GRID_COLS * BLOCK_SIZE, GRID_ROWS * BLOCK_SIZE),
-                         (0, 0, 0, 255))
+    # Resizable window: start at a size that fits most screens, never
+    # smaller than what the sidebar + a minimum canvas need.
+    root.resizable(True, True)
+    start_w = min(root.winfo_screenwidth()  - 80, 980)
+    start_h = min(root.winfo_screenheight() - 120, 760)
+    root.geometry(f'{start_w}x{start_h}')
+    root.minsize(540, 360)   # sidebar scrolls, so short windows are fine
+
+    frames.append(_new_blank_frame())
+    image    = frames[0]
     draw_img = ImageDraw.Draw(image)
 
     menu_bar  = tk.Menu(root)
     file_menu = tk.Menu(menu_bar, tearoff=0)
     menu_bar.add_cascade(label='File', menu=file_menu)
-    file_menu.add_command(label='New',  command=new_image)
-    file_menu.add_command(label='Open', command=open_image)
-    file_menu.add_command(label='Save', command=save_image)
+    file_menu.add_command(label='New',            command=new_animation)
+    file_menu.add_command(label='Open (PNG/GIF)', command=open_image)
+    file_menu.add_command(label='Save frame (PNG)', command=save_image)
+    file_menu.add_command(label='Export GIF',     command=export_gif)
     file_menu.add_separator()
     file_menu.add_command(label='Exit', command=root.destroy)
     root.config(menu=menu_bar)
 
     main_frame = tk.Frame(root)
     main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+    main_frame.columnconfigure(1, weight=1)   # canvas column absorbs resize
+    main_frame.rowconfigure(0, weight=1)      # canvas row absorbs resize
 
-    sidebar = tk.Frame(main_frame, width=220)
-    sidebar.grid(row=0, column=0, sticky='ns', padx=(0, 12))
+    # Sidebar — scrollable, so the tools never get cut off in short windows.
+    # The scrollbar only appears when the content doesn't fit.
+    sidebar_outer = tk.Frame(main_frame)
+    sidebar_outer.grid(row=0, column=0, rowspan=2, sticky='ns', padx=(0, 12))
+
+    sidebar_canvas = tk.Canvas(sidebar_outer, width=200,
+                               highlightthickness=0, yscrollincrement=20)
+    sidebar_scroll = tk.Scrollbar(sidebar_outer, orient='vertical',
+                                  command=sidebar_canvas.yview)
+    sidebar_canvas.config(yscrollcommand=sidebar_scroll.set)
+    sidebar_canvas.pack(side='left', fill='both', expand=True)
+
+    sidebar = tk.Frame(sidebar_canvas)
+    sidebar_canvas.create_window((0, 0), window=sidebar, anchor='nw')
+
+    def _sync_sidebar(event=None):
+        sidebar_canvas.config(
+            scrollregion=sidebar_canvas.bbox('all') or (0, 0, 0, 0),
+            width=sidebar.winfo_reqwidth())
+        if sidebar.winfo_reqheight() > sidebar_canvas.winfo_height():
+            sidebar_scroll.pack(side='right', fill='y')
+        else:
+            sidebar_scroll.pack_forget()
+            sidebar_canvas.yview_moveto(0)   # snap back when it fits again
+
+    sidebar.bind('<Configure>', _sync_sidebar)
+    sidebar_canvas.bind('<Configure>', _sync_sidebar)
+
+    def _on_global_wheel(event):
+        # Scroll the sidebar only when the pointer is over it AND it
+        # actually overflows. (str(widget) is the Tk path, so startswith
+        # checks "is inside the sidebar".)
+        w = root.winfo_containing(event.x_root, event.y_root)
+        if w is None or not str(w).startswith(str(sidebar_outer)):
+            return
+        if sidebar.winfo_reqheight() <= sidebar_canvas.winfo_height():
+            return
+        if getattr(event, 'num', None) == 4 or event.delta > 0:
+            sidebar_canvas.yview_scroll(-2, 'units')
+        else:
+            sidebar_canvas.yview_scroll(2, 'units')
+
+    # Windows/macOS deliver <MouseWheel>; Linux delivers Button-4/5.
+    root.bind_all('<MouseWheel>', _on_global_wheel)
+    root.bind_all('<Button-4>',  _on_global_wheel)
+    root.bind_all('<Button-5>',  _on_global_wheel)
 
     # Connection
     tk.Label(sidebar, text='Connection',
@@ -526,7 +829,7 @@ def setup_app():
     # Cable controls
     cable_frame = tk.Frame(sidebar)
     port_var   = tk.StringVar()
-    port_combo = tk.ttk.Combobox(cable_frame, textvariable=port_var, width=12)
+    port_combo = ttk.Combobox(cable_frame, textvariable=port_var, width=12)
     port_combo.pack(side='left')
     tk.Button(cable_frame, text='\u21bb', width=2,
               command=_refresh_ports).pack(side='left', padx=2)
@@ -573,42 +876,91 @@ def setup_app():
                              relief='solid', bd=1)
     color_preview.pack(fill='x')
 
-    # Tools
+    # Tools (two rows so the sidebar stays narrow)
     tk.Label(sidebar, text='Tool', font=('TkDefaultFont', 10, 'bold')).pack(anchor='w', pady=(10,4))
     tool_frame = tk.Frame(sidebar)
     tool_frame.pack(fill='x')
     global tool_buttons
     tool_buttons = {}
-    for name in ['draw', 'erase', 'fill']:
+    layout = {'draw': (0, 0), 'erase': (0, 1), 'fill': (0, 2),
+              'pick': (1, 0)}
+    for name, (r, c) in layout.items():
         btn = tk.Button(tool_frame, text=name.capitalize(), width=5,
                         command=lambda t=name: set_tool(t))
-        btn.pack(side='left', padx=2)
+        btn.grid(row=r, column=c, padx=2, pady=2)
         tool_buttons[name] = btn
     set_tool('draw')
     tk.Button(tool_frame, text='Clear', width=5,
-              command=new_image).pack(side='left', padx=2)
+              command=clear_frame).grid(row=1, column=1, padx=2, pady=2)
 
-    # Canvas
+    # Canvas area: fills all remaining space; the grid scales to fit it.
     canvas_frame = tk.Frame(main_frame, bg='#e8e8e8')
     canvas_frame.grid(row=0, column=1, sticky='nsew')
+    canvas_frame.grid_propagate(False)        # size comes from the window,
+    canvas_frame.config(width=300, height=300)  # not from the canvas inside
+    canvas_frame.bind('<Configure>', _on_canvas_area_resize)
 
     global canvas
     canvas = tk.Canvas(canvas_frame, bg='black',
                        highlightthickness=1, highlightbackground='#cccccc',
                        cursor='crosshair')
-    canvas.pack()
+    canvas.place(relx=0.5, rely=0.5, anchor='center')   # stay centered
     canvas.bind('<Button-1>',        start_paint)
     canvas.bind('<B1-Motion>',       on_motion)
     canvas.bind('<ButtonRelease-1>', stop_paint)
 
+    # Animation bar (controls + frame strip) under the canvas
+    anim_frame = tk.Frame(main_frame)
+    anim_frame.grid(row=1, column=1, sticky='ew', pady=(8, 0))
+
+    ctrl = tk.Frame(anim_frame)
+    ctrl.pack(fill='x')
+
+    play_btn = tk.Button(ctrl, text='\u25b6 Play', width=7,
+                         command=_toggle_play)
+    play_btn.pack(side='left')
+
+    tk.Label(ctrl, text='FPS').pack(side='left', padx=(10, 2))
+    fps_var = tk.IntVar(value=8)
+    tk.Spinbox(ctrl, from_=1, to=30, textvariable=fps_var,
+               width=4).pack(side='left')
+
+    tk.Button(ctrl, text='+ Add', width=7,
+              command=add_frame).pack(side='left', padx=(18, 2))
+    tk.Button(ctrl, text='Duplicate', width=8,
+              command=duplicate_frame).pack(side='left', padx=2)
+    tk.Button(ctrl, text='Delete', width=6,
+              command=delete_frame).pack(side='left', padx=2)
+
+    frame_pos_lbl = tk.Label(ctrl, text='Frame 1 / 1', fg='#555',
+                             font=('TkDefaultFont', 9))
+    frame_pos_lbl.pack(side='right')
+
+    # Scrollable thumbnail strip
+    strip_canvas = tk.Canvas(anim_frame, height=THUMB_H + 28,
+                             highlightthickness=0)
+    strip_scroll = tk.Scrollbar(anim_frame, orient='horizontal',
+                                command=strip_canvas.xview)
+    strip_canvas.config(xscrollcommand=strip_scroll.set)
+    strip_inner = tk.Frame(strip_canvas)
+    strip_canvas.create_window((0, 0), window=strip_inner, anchor='nw')
+    strip_canvas.pack(fill='x', pady=(4, 0))
+    strip_scroll.pack(fill='x')
+
+    # Left/Right arrows step through frames (when not typing in a field)
+    root.bind('<Left>',  lambda e: _step_frame(-1))
+    root.bind('<Right>', lambda e: _step_frame(1))
+
     _refresh_ports()
+    _init_canvas_cells()
     redraw_canvas()
     draw_color_wheel()
+    _rebuild_frame_strip()
+    root.after(50, _apply_canvas_size)   # fit the grid to the initial window
 
     threading.Thread(target=_serial_sender, daemon=True).start()
 
 
 if __name__ == '__main__':
-    from tkinter import ttk
     setup_app()
     root.mainloop()
