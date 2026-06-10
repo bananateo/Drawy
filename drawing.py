@@ -21,7 +21,13 @@ BAUD_RATE     = 500000
 GRID_COLS = 32
 GRID_ROWS = 8 * NUM_MATRICES
 
-BLOCK_SIZE = 20
+# The canvas zoom (pixels per grid cell) is now DYNAMIC: it is recomputed
+# whenever the window is resized, so the whole app scales like any normal
+# window. Frames are stored at native grid resolution (32x32), independent
+# of how big they are drawn on screen.
+MIN_CELL  = 6        # don't let cells get smaller than this
+cell_size = 20       # current zoom; updated on window resize
+
 CHUNK_SIZE = 20
 
 MAX_RETRIES = 5
@@ -53,7 +59,7 @@ dirty    = False
 prev_leds = {}   # pixel_index -> (R, G, B)
 
 # Animation state
-frames        = []      # list of PIL Images; `image` always points at frames[current_frame]
+frames        = []      # list of native-resolution PIL Images
 current_frame = 0
 is_playing    = False
 play_job      = None    # root.after() id while playing
@@ -64,6 +70,7 @@ THUMB_H = max(1, int(THUMB_W * GRID_ROWS / GRID_COLS))
 thumb_refs    = []      # keep PhotoImage references alive
 thumb_buttons = []
 canvas_rects  = []      # one canvas rectangle per grid cell, created once
+_resize_job   = None    # debounce id for window-resize events
 
 
 # Wi-Fi socket wrapper that mimics serial.Serial
@@ -205,15 +212,15 @@ def on_shade_change(val):
 
 # Canvas / drawing
 def _init_canvas_cells():
-    # Create every grid cell ONCE; redraws just recolor them. This makes
-    # full-canvas refreshes fast enough for animation playback.
-    canvas.config(width=GRID_COLS * BLOCK_SIZE, height=GRID_ROWS * BLOCK_SIZE)
+    # Create every grid cell ONCE; redraws just recolor them and window
+    # resizes just move/scale them. This keeps everything fast.
+    canvas.config(width=GRID_COLS * cell_size, height=GRID_ROWS * cell_size)
     canvas.delete('all')
     canvas_rects.clear()
     for y in range(GRID_ROWS):
         for x in range(GRID_COLS):
-            x0, y0 = x * BLOCK_SIZE, y * BLOCK_SIZE
-            rid = canvas.create_rectangle(x0, y0, x0+BLOCK_SIZE, y0+BLOCK_SIZE,
+            x0, y0 = x * cell_size, y * cell_size
+            rid = canvas.create_rectangle(x0, y0, x0+cell_size, y0+cell_size,
                                           fill='#000000', outline='#333333',
                                           width=1)
             canvas_rects.append(rid)
@@ -222,9 +229,37 @@ def _init_canvas_cells():
 def redraw_canvas():
     for y in range(GRID_ROWS):
         for x in range(GRID_COLS):
-            color = image.getpixel((x * BLOCK_SIZE, y * BLOCK_SIZE))
+            color = image.getpixel((x, y))
             canvas.itemconfig(canvas_rects[y * GRID_COLS + x],
                               fill='#{:02x}{:02x}{:02x}'.format(*color[:3]))
+
+
+# Window resizing: pick the biggest cell size that fits, then move the
+# existing rectangles. Debounced so dragging the window edge stays smooth.
+def _on_canvas_area_resize(event=None):
+    global _resize_job
+    if _resize_job is not None:
+        root.after_cancel(_resize_job)
+    _resize_job = root.after(60, _apply_canvas_size)
+
+
+def _apply_canvas_size():
+    global cell_size, _resize_job
+    _resize_job = None
+    w = canvas_frame.winfo_width()  - 4
+    h = canvas_frame.winfo_height() - 4
+    if w <= 0 or h <= 0:
+        return
+    cell = max(MIN_CELL, min(w // GRID_COLS, h // GRID_ROWS))
+    if cell == cell_size:
+        return
+    cell_size = cell
+    canvas.config(width=GRID_COLS * cell, height=GRID_ROWS * cell)
+    for y in range(GRID_ROWS):
+        for x in range(GRID_COLS):
+            rid = canvas_rects[y * GRID_COLS + x]
+            canvas.coords(rid, x * cell, y * cell,
+                          (x + 1) * cell, (y + 1) * cell)
 
 
 def start_paint(event):
@@ -248,8 +283,8 @@ def on_motion(event):
 
 
 def apply_tool(event):
-    xi = event.x // BLOCK_SIZE
-    yi = event.y // BLOCK_SIZE
+    xi = event.x // cell_size
+    yi = event.y // cell_size
     if not (0 <= xi < GRID_COLS and 0 <= yi < GRID_ROWS):
         return
     if   current_tool == 'draw':  paint_pixel(xi, yi, brush_color)
@@ -260,10 +295,8 @@ def apply_tool(event):
 
 def paint_pixel(xi, yi, color):
     global dirty
-    x0, y0 = xi * BLOCK_SIZE, yi * BLOCK_SIZE
-    x1, y1 = x0 + BLOCK_SIZE - 1, y0 + BLOCK_SIZE - 1
     rgb = hex_to_rgb(color)
-    draw_img.rectangle([(x0, y0), (x1, y1)], fill=(*rgb, 255))
+    image.putpixel((xi, yi), (*rgb, 255))
     canvas.itemconfig(canvas_rects[yi * GRID_COLS + xi], fill=color)
     dirty = True
 
@@ -272,7 +305,7 @@ def paint_pixel(xi, yi, color):
 # slider to it, then hop back to the Draw tool.
 def pick_canvas_color(xi, yi):
     global hue, saturation, shade, is_painting
-    rgb = image.getpixel((xi * BLOCK_SIZE, yi * BLOCK_SIZE))[:3]
+    rgb = image.getpixel((xi, yi))[:3]
     h, s, l = rgb_to_hsl(*rgb)
     hue        = h
     saturation = s / 100
@@ -285,7 +318,7 @@ def pick_canvas_color(xi, yi):
 
 
 def flood_fill(xi, yi):
-    target   = image.getpixel((xi * BLOCK_SIZE, yi * BLOCK_SIZE))[:3]
+    target   = image.getpixel((xi, yi))[:3]
     fill_rgb = hex_to_rgb(brush_color)
     if target == fill_rgb:
         return
@@ -294,14 +327,12 @@ def flood_fill(xi, yi):
         x, y = stack.pop()
         if (x, y) in visited or not (0 <= x < GRID_COLS and 0 <= y < GRID_ROWS):
             continue
-        if image.getpixel((x * BLOCK_SIZE, y * BLOCK_SIZE))[:3] != target:
+        if image.getpixel((x, y))[:3] != target:
             continue
         visited.add((x, y))
         stack.extend([(x+1,y),(x-1,y),(x,y+1),(x,y-1)])
     for x, y in visited:
-        x0, y0 = x * BLOCK_SIZE, y * BLOCK_SIZE
-        draw_img.rectangle([(x0, y0), (x0+BLOCK_SIZE-1, y0+BLOCK_SIZE-1)],
-                           fill=(*fill_rgb, 255))
+        image.putpixel((x, y), (*fill_rgb, 255))
     global dirty
     dirty = True
     redraw_canvas()
@@ -316,11 +347,9 @@ def set_tool(tool_name):
                    bg='#dde'     if name == tool_name else '#f0f0f0')
 
 
-# Animation: frames
+# Animation: frames (stored at native grid resolution)
 def _new_blank_frame():
-    return Image.new('RGBA',
-                     (GRID_COLS * BLOCK_SIZE, GRID_ROWS * BLOCK_SIZE),
-                     (0, 0, 0, 255))
+    return Image.new('RGBA', (GRID_COLS, GRID_ROWS), (0, 0, 0, 255))
 
 
 def _select_frame(idx, rebuild=False):
@@ -361,7 +390,7 @@ def delete_frame():
 def clear_frame():
     global dirty
     _stop_playback()
-    draw_img.rectangle([(0, 0), (image.width - 1, image.height - 1)],
+    draw_img.rectangle([(0, 0), (GRID_COLS - 1, GRID_ROWS - 1)],
                        fill=(0, 0, 0, 255))
     dirty = True
     redraw_canvas()
@@ -472,7 +501,7 @@ def open_image():
         return
     _stop_playback()
     img  = Image.open(path)
-    size = (GRID_COLS * BLOCK_SIZE, GRID_ROWS * BLOCK_SIZE)
+    size = (GRID_COLS, GRID_ROWS)
     if getattr(img, 'n_frames', 1) > 1:
         # Animated GIF -> replaces the whole animation
         frames[:] = [f.convert('RGBA').resize(size, Image.NEAREST)
@@ -490,7 +519,7 @@ def save_image():
         defaultextension='.png',
         filetypes=[('PNG files', '*.png'), ('All files', '*.*')])
     if path:
-        image.resize((GRID_COLS, GRID_ROWS), Image.NEAREST).save(path)
+        image.save(path)
 
 
 def export_gif():
@@ -500,8 +529,7 @@ def export_gif():
     if not path:
         return
     scale = 8   # upscale so the GIF is viewable; Open re-downscales fine
-    out = [f.resize((GRID_COLS, GRID_ROWS), Image.NEAREST)
-            .resize((GRID_COLS * scale, GRID_ROWS * scale), Image.NEAREST)
+    out = [f.resize((GRID_COLS * scale, GRID_ROWS * scale), Image.NEAREST)
             .convert('RGB')
            for f in frames]
     out[0].save(path, save_all=True, append_images=out[1:],
@@ -562,7 +590,7 @@ def _build_frame():
             physical_col  = matrix_index * GRID_COLS + canvas_col  # col across full strip
             pixel_index = local_row * PHYSICAL_COLS + physical_col
 
-            px  = image.getpixel((canvas_col * BLOCK_SIZE, canvas_row * BLOCK_SIZE))
+            px  = image.getpixel((canvas_col, canvas_row))
             rgb = (px[0], px[1], px[2])
             if prev_leds.get(pixel_index) != rgb:
                 changed.append((pixel_index, rgb))
@@ -692,8 +720,8 @@ def _on_transport_change():
 
 # UI
 def setup_app():
-    global root, image, draw_img, canvas, wheel_canvas, color_preview
-    global shade_slider, led_brightness_slider, tool_buttons
+    global root, image, draw_img, canvas, canvas_frame, wheel_canvas
+    global color_preview, shade_slider, led_brightness_slider, tool_buttons
     global port_var, port_combo, connect_btn, status_lbl
     global transport_var, transport_frame, wifi_frame, cable_frame
     global ip_var, port_num_var
@@ -701,7 +729,14 @@ def setup_app():
 
     root = tk.Tk()
     root.title(f'Drawy  —  {GRID_COLS}x{GRID_ROWS}  ({NUM_MATRICES} panels)')
-    root.resizable(False, False)
+
+    # Resizable window: start at a size that fits most screens, never
+    # smaller than what the sidebar + a minimum canvas need.
+    root.resizable(True, True)
+    start_w = min(root.winfo_screenwidth()  - 80, 980)
+    start_h = min(root.winfo_screenheight() - 120, 760)
+    root.geometry(f'{start_w}x{start_h}')
+    root.minsize(540, 360)   # sidebar scrolls, so short windows are fine
 
     frames.append(_new_blank_frame())
     image    = frames[0]
@@ -720,9 +755,55 @@ def setup_app():
 
     main_frame = tk.Frame(root)
     main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+    main_frame.columnconfigure(1, weight=1)   # canvas column absorbs resize
+    main_frame.rowconfigure(0, weight=1)      # canvas row absorbs resize
 
-    sidebar = tk.Frame(main_frame, width=220)
-    sidebar.grid(row=0, column=0, rowspan=2, sticky='ns', padx=(0, 12))
+    # Sidebar — scrollable, so the tools never get cut off in short windows.
+    # The scrollbar only appears when the content doesn't fit.
+    sidebar_outer = tk.Frame(main_frame)
+    sidebar_outer.grid(row=0, column=0, rowspan=2, sticky='ns', padx=(0, 12))
+
+    sidebar_canvas = tk.Canvas(sidebar_outer, width=200,
+                               highlightthickness=0, yscrollincrement=20)
+    sidebar_scroll = tk.Scrollbar(sidebar_outer, orient='vertical',
+                                  command=sidebar_canvas.yview)
+    sidebar_canvas.config(yscrollcommand=sidebar_scroll.set)
+    sidebar_canvas.pack(side='left', fill='both', expand=True)
+
+    sidebar = tk.Frame(sidebar_canvas)
+    sidebar_canvas.create_window((0, 0), window=sidebar, anchor='nw')
+
+    def _sync_sidebar(event=None):
+        sidebar_canvas.config(
+            scrollregion=sidebar_canvas.bbox('all') or (0, 0, 0, 0),
+            width=sidebar.winfo_reqwidth())
+        if sidebar.winfo_reqheight() > sidebar_canvas.winfo_height():
+            sidebar_scroll.pack(side='right', fill='y')
+        else:
+            sidebar_scroll.pack_forget()
+            sidebar_canvas.yview_moveto(0)   # snap back when it fits again
+
+    sidebar.bind('<Configure>', _sync_sidebar)
+    sidebar_canvas.bind('<Configure>', _sync_sidebar)
+
+    def _on_global_wheel(event):
+        # Scroll the sidebar only when the pointer is over it AND it
+        # actually overflows. (str(widget) is the Tk path, so startswith
+        # checks "is inside the sidebar".)
+        w = root.winfo_containing(event.x_root, event.y_root)
+        if w is None or not str(w).startswith(str(sidebar_outer)):
+            return
+        if sidebar.winfo_reqheight() <= sidebar_canvas.winfo_height():
+            return
+        if getattr(event, 'num', None) == 4 or event.delta > 0:
+            sidebar_canvas.yview_scroll(-2, 'units')
+        else:
+            sidebar_canvas.yview_scroll(2, 'units')
+
+    # Windows/macOS deliver <MouseWheel>; Linux delivers Button-4/5.
+    root.bind_all('<MouseWheel>', _on_global_wheel)
+    root.bind_all('<Button-4>',  _on_global_wheel)
+    root.bind_all('<Button-5>',  _on_global_wheel)
 
     # Connection
     tk.Label(sidebar, text='Connection',
@@ -812,15 +893,18 @@ def setup_app():
     tk.Button(tool_frame, text='Clear', width=5,
               command=clear_frame).grid(row=1, column=1, padx=2, pady=2)
 
-    # Canvas
+    # Canvas area: fills all remaining space; the grid scales to fit it.
     canvas_frame = tk.Frame(main_frame, bg='#e8e8e8')
     canvas_frame.grid(row=0, column=1, sticky='nsew')
+    canvas_frame.grid_propagate(False)        # size comes from the window,
+    canvas_frame.config(width=300, height=300)  # not from the canvas inside
+    canvas_frame.bind('<Configure>', _on_canvas_area_resize)
 
     global canvas
     canvas = tk.Canvas(canvas_frame, bg='black',
                        highlightthickness=1, highlightbackground='#cccccc',
                        cursor='crosshair')
-    canvas.pack()
+    canvas.place(relx=0.5, rely=0.5, anchor='center')   # stay centered
     canvas.bind('<Button-1>',        start_paint)
     canvas.bind('<B1-Motion>',       on_motion)
     canvas.bind('<ButtonRelease-1>', stop_paint)
@@ -872,6 +956,7 @@ def setup_app():
     redraw_canvas()
     draw_color_wheel()
     _rebuild_frame_strip()
+    root.after(50, _apply_canvas_size)   # fit the grid to the initial window
 
     threading.Thread(target=_serial_sender, daemon=True).start()
 
