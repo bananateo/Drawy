@@ -1,6 +1,6 @@
 import tkinter as tk
-from tkinter import filedialog
-from PIL import Image, ImageDraw
+from tkinter import filedialog, ttk
+from PIL import Image, ImageDraw, ImageTk, ImageSequence
 import math
 import serial
 import serial.tools.list_ports
@@ -52,6 +52,19 @@ dirty    = False
 
 prev_leds = {}   # pixel_index -> (R, G, B)
 
+# Animation state
+frames        = []      # list of PIL Images; `image` always points at frames[current_frame]
+current_frame = 0
+is_playing    = False
+play_job      = None    # root.after() id while playing
+
+THUMB_W = 48
+THUMB_H = max(1, int(THUMB_W * GRID_ROWS / GRID_COLS))
+
+thumb_refs    = []      # keep PhotoImage references alive
+thumb_buttons = []
+canvas_rects  = []      # one canvas rectangle per grid cell, created once
+
 
 # Wi-Fi socket wrapper that mimics serial.Serial
 class WifiSerial:
@@ -99,6 +112,22 @@ def hsl_to_rgb(h, s, l):
     elif h < 300: r, g, b = x, 0, c
     else:         r, g, b = c, 0, x
     return int((r + m) * 255), int((g + m) * 255), int((b + m) * 255)
+
+
+def rgb_to_hsl(r, g, b):
+    # Inverse of hsl_to_rgb, used by the eyedropper so the wheel + shade
+    # slider jump to the picked color.
+    r, g, b = r / 255, g / 255, b / 255
+    mx, mn = max(r, g, b), min(r, g, b)
+    l = (mx + mn) / 2
+    if mx == mn:
+        return 0.0, 0.0, l * 100
+    d = mx - mn
+    s = d / (1 - abs(2 * l - 1))
+    if   mx == r: h = ((g - b) / d) % 6
+    elif mx == g: h = (b - r) / d + 2
+    else:         h = (r - g) / d + 4
+    return h * 60, min(s, 1.0) * 100, l * 100
 
 
 def rgb_to_hex(r, g, b):
@@ -175,31 +204,46 @@ def on_shade_change(val):
 
 
 # Canvas / drawing
-def redraw_canvas():
+def _init_canvas_cells():
+    # Create every grid cell ONCE; redraws just recolor them. This makes
+    # full-canvas refreshes fast enough for animation playback.
     canvas.config(width=GRID_COLS * BLOCK_SIZE, height=GRID_ROWS * BLOCK_SIZE)
     canvas.delete('all')
+    canvas_rects.clear()
     for y in range(GRID_ROWS):
         for x in range(GRID_COLS):
             x0, y0 = x * BLOCK_SIZE, y * BLOCK_SIZE
-            color = image.getpixel((x0, y0))
-            hex_color = '#{:02x}{:02x}{:02x}'.format(*color[:3])
-            canvas.create_rectangle(x0, y0, x0+BLOCK_SIZE, y0+BLOCK_SIZE,
-                                    fill=hex_color, outline='#333333', width=1)
+            rid = canvas.create_rectangle(x0, y0, x0+BLOCK_SIZE, y0+BLOCK_SIZE,
+                                          fill='#000000', outline='#333333',
+                                          width=1)
+            canvas_rects.append(rid)
+
+
+def redraw_canvas():
+    for y in range(GRID_ROWS):
+        for x in range(GRID_COLS):
+            color = image.getpixel((x * BLOCK_SIZE, y * BLOCK_SIZE))
+            canvas.itemconfig(canvas_rects[y * GRID_COLS + x],
+                              fill='#{:02x}{:02x}{:02x}'.format(*color[:3]))
 
 
 def start_paint(event):
     global is_painting
+    if is_playing:
+        _stop_playback()
     is_painting = True
     apply_tool(event)
 
 
 def stop_paint(event):
     global is_painting
+    if is_painting and current_tool in ('draw', 'erase'):
+        _refresh_current_thumb()
     is_painting = False
 
 
 def on_motion(event):
-    if is_painting and current_tool != 'fill':
+    if is_painting and current_tool in ('draw', 'erase'):
         apply_tool(event)
 
 
@@ -211,6 +255,7 @@ def apply_tool(event):
     if   current_tool == 'draw':  paint_pixel(xi, yi, brush_color)
     elif current_tool == 'erase': paint_pixel(xi, yi, '#000000')
     elif current_tool == 'fill':  flood_fill(xi, yi)
+    elif current_tool == 'pick':  pick_canvas_color(xi, yi)
 
 
 def paint_pixel(xi, yi, color):
@@ -219,9 +264,24 @@ def paint_pixel(xi, yi, color):
     x1, y1 = x0 + BLOCK_SIZE - 1, y0 + BLOCK_SIZE - 1
     rgb = hex_to_rgb(color)
     draw_img.rectangle([(x0, y0), (x1, y1)], fill=(*rgb, 255))
-    canvas.create_rectangle(x0, y0, x0 + BLOCK_SIZE, y0 + BLOCK_SIZE,
-                            fill=color, outline='#333333', width=1)
+    canvas.itemconfig(canvas_rects[yi * GRID_COLS + xi], fill=color)
     dirty = True
+
+
+# Eyedropper: grab the color under the cursor, sync the wheel + shade
+# slider to it, then hop back to the Draw tool.
+def pick_canvas_color(xi, yi):
+    global hue, saturation, shade, is_painting
+    rgb = image.getpixel((xi * BLOCK_SIZE, yi * BLOCK_SIZE))[:3]
+    h, s, l = rgb_to_hsl(*rgb)
+    hue        = h
+    saturation = s / 100
+    shade      = 1 - l / 100
+    shade_slider.set(shade)        # keep the slider in sync
+    _update_brush_color()
+    draw_color_wheel()
+    is_painting = False            # don't start drawing on the same drag
+    set_tool('draw')
 
 
 def flood_fill(xi, yi):
@@ -245,6 +305,7 @@ def flood_fill(xi, yi):
     global dirty
     dirty = True
     redraw_canvas()
+    _refresh_current_thumb()
 
 
 def set_tool(tool_name):
@@ -255,15 +316,196 @@ def set_tool(tool_name):
                    bg='#dde'     if name == tool_name else '#f0f0f0')
 
 
-def new_image():
-    global image, draw_img, dirty
-    image = Image.new('RGBA',
-                      (GRID_COLS * BLOCK_SIZE, GRID_ROWS * BLOCK_SIZE),
-                      (0, 0, 0, 255))
+# Animation: frames
+def _new_blank_frame():
+    return Image.new('RGBA',
+                     (GRID_COLS * BLOCK_SIZE, GRID_ROWS * BLOCK_SIZE),
+                     (0, 0, 0, 255))
+
+
+def _select_frame(idx, rebuild=False):
+    """Make frames[idx] the one shown on the canvas (and on the LEDs)."""
+    global current_frame, image, draw_img, dirty
+    current_frame = idx
+    image    = frames[idx]
     draw_img = ImageDraw.Draw(image)
-    prev_leds.clear()
+    redraw_canvas()
+    if rebuild:
+        _rebuild_frame_strip()
+    else:
+        _update_strip_selection()
+    dirty = True     # the LED panel always shows the selected frame
+
+
+def add_frame():
+    _stop_playback()
+    frames.insert(current_frame + 1, _new_blank_frame())
+    _select_frame(current_frame + 1, rebuild=True)
+
+
+def duplicate_frame():
+    _stop_playback()
+    frames.insert(current_frame + 1, frames[current_frame].copy())
+    _select_frame(current_frame + 1, rebuild=True)
+
+
+def delete_frame():
+    _stop_playback()
+    if len(frames) == 1:
+        clear_frame()            # deleting the last frame just clears it
+        return
+    frames.pop(current_frame)
+    _select_frame(min(current_frame, len(frames) - 1), rebuild=True)
+
+
+def clear_frame():
+    global dirty
+    _stop_playback()
+    draw_img.rectangle([(0, 0), (image.width - 1, image.height - 1)],
+                       fill=(0, 0, 0, 255))
     dirty = True
     redraw_canvas()
+    _refresh_current_thumb()
+
+
+def _step_frame(delta):
+    w = root.focus_get()
+    if isinstance(w, (tk.Entry, tk.Spinbox, ttk.Combobox)):
+        return                   # don't steal arrow keys from text fields
+    _stop_playback()
+    _select_frame((current_frame + delta) % len(frames))
+
+
+# Animation: frame strip UI
+def _rebuild_frame_strip():
+    for w in strip_inner.winfo_children():
+        w.destroy()
+    thumb_refs.clear()
+    thumb_buttons.clear()
+    for i, f in enumerate(frames):
+        ph = ImageTk.PhotoImage(f.resize((THUMB_W, THUMB_H), Image.NEAREST))
+        thumb_refs.append(ph)
+        btn = tk.Button(strip_inner, image=ph, text=str(i + 1),
+                        compound='top', font=('TkDefaultFont', 8), bd=1,
+                        command=lambda i=i: (_stop_playback(),
+                                             _select_frame(i)))
+        btn.pack(side='left', padx=2, pady=2)
+        thumb_buttons.append(btn)
+    _update_strip_selection()
+    strip_inner.update_idletasks()
+    strip_canvas.config(scrollregion=strip_canvas.bbox('all') or (0, 0, 0, 0))
+
+
+def _update_strip_selection():
+    for i, btn in enumerate(thumb_buttons):
+        sel = (i == current_frame)
+        btn.config(bg='#cde' if sel else '#f0f0f0',
+                   relief='sunken' if sel else 'raised')
+    frame_pos_lbl.config(text=f'Frame {current_frame + 1} / {len(frames)}')
+
+
+def _refresh_current_thumb():
+    if current_frame < len(thumb_buttons):
+        ph = ImageTk.PhotoImage(
+            frames[current_frame].resize((THUMB_W, THUMB_H), Image.NEAREST))
+        thumb_refs[current_frame] = ph
+        thumb_buttons[current_frame].config(image=ph)
+
+
+# Animation: playback (the LED wall plays along, since selecting a frame
+# marks it dirty and the sender thread pushes the delta)
+def _toggle_play():
+    global is_playing
+    if is_playing:
+        _stop_playback()
+        return
+    if len(frames) < 2:
+        return
+    is_playing = True
+    play_btn.config(text='\u25a0 Stop')
+    _play_step()
+
+
+def _play_step():
+    global play_job
+    if not is_playing:
+        return
+    _select_frame((current_frame + 1) % len(frames))
+    delay = max(20, int(1000 / max(1, _get_fps())))
+    play_job = root.after(delay, _play_step)
+
+
+def _stop_playback():
+    global is_playing, play_job
+    is_playing = False
+    if play_job is not None:
+        root.after_cancel(play_job)
+        play_job = None
+    if play_btn is not None:
+        play_btn.config(text='\u25b6 Play')
+
+
+def _get_fps():
+    try:
+        return max(1, min(30, int(fps_var.get())))
+    except Exception:
+        return 8
+
+
+# File menu
+def new_animation():
+    global frames
+    _stop_playback()
+    frames[:] = [_new_blank_frame()]
+    prev_leds.clear()
+    _select_frame(0, rebuild=True)
+
+
+def open_image():
+    global frames
+    path = filedialog.askopenfilename(
+        filetypes=[('Images', '*.png *.gif'),
+                   ('PNG files', '*.png'),
+                   ('GIF files', '*.gif'),
+                   ('All files', '*.*')])
+    if not path:
+        return
+    _stop_playback()
+    img  = Image.open(path)
+    size = (GRID_COLS * BLOCK_SIZE, GRID_ROWS * BLOCK_SIZE)
+    if getattr(img, 'n_frames', 1) > 1:
+        # Animated GIF -> replaces the whole animation
+        frames[:] = [f.convert('RGBA').resize(size, Image.NEAREST)
+                     for f in ImageSequence.Iterator(img)]
+        prev_leds.clear()
+        _select_frame(0, rebuild=True)
+    else:
+        # Still image -> loads into the CURRENT frame only
+        frames[current_frame] = img.convert('RGBA').resize(size, Image.NEAREST)
+        _select_frame(current_frame, rebuild=True)
+
+
+def save_image():
+    path = filedialog.asksaveasfilename(
+        defaultextension='.png',
+        filetypes=[('PNG files', '*.png'), ('All files', '*.*')])
+    if path:
+        image.resize((GRID_COLS, GRID_ROWS), Image.NEAREST).save(path)
+
+
+def export_gif():
+    path = filedialog.asksaveasfilename(
+        defaultextension='.gif',
+        filetypes=[('GIF files', '*.gif'), ('All files', '*.*')])
+    if not path:
+        return
+    scale = 8   # upscale so the GIF is viewable; Open re-downscales fine
+    out = [f.resize((GRID_COLS, GRID_ROWS), Image.NEAREST)
+            .resize((GRID_COLS * scale, GRID_ROWS * scale), Image.NEAREST)
+            .convert('RGB')
+           for f in frames]
+    out[0].save(path, save_all=True, append_images=out[1:],
+                duration=int(1000 / _get_fps()), loop=0)
 
 
 # Forces all LEDs to turn off
@@ -288,27 +530,6 @@ def _send_blackout():
             _set_status('ok', 'Cleared')
         except Exception as e:
             _set_status('error', f'Blackout failed: {e}')
-
-
-def open_image():
-    global image, draw_img, dirty
-    path = filedialog.askopenfilename(
-        filetypes=[('PNG files', '*.png'), ('All files', '*.*')])
-    if path:
-        img      = Image.open(path).convert('RGBA')
-        image    = img.resize((GRID_COLS * BLOCK_SIZE, GRID_ROWS * BLOCK_SIZE),
-                              Image.NEAREST)
-        draw_img = ImageDraw.Draw(image)
-        prev_leds.clear()
-        dirty = True
-        redraw_canvas()
-
-def save_image():
-    path = filedialog.asksaveasfilename(
-        defaultextension='.png',
-        filetypes=[('PNG files', '*.png'), ('All files', '*.*')])
-    if path:
-        image.resize((GRID_COLS, GRID_ROWS), Image.NEAREST).save(path)
 
 
 # LED panel brightness (separate from color shade) -> sent to the ESP32
@@ -476,22 +697,23 @@ def setup_app():
     global port_var, port_combo, connect_btn, status_lbl
     global transport_var, transport_frame, wifi_frame, cable_frame
     global ip_var, port_num_var
+    global play_btn, fps_var, frame_pos_lbl, strip_canvas, strip_inner
 
     root = tk.Tk()
     root.title(f'Drawy  —  {GRID_COLS}x{GRID_ROWS}  ({NUM_MATRICES} panels)')
     root.resizable(False, False)
 
-    image    = Image.new('RGBA',
-                         (GRID_COLS * BLOCK_SIZE, GRID_ROWS * BLOCK_SIZE),
-                         (0, 0, 0, 255))
+    frames.append(_new_blank_frame())
+    image    = frames[0]
     draw_img = ImageDraw.Draw(image)
 
     menu_bar  = tk.Menu(root)
     file_menu = tk.Menu(menu_bar, tearoff=0)
     menu_bar.add_cascade(label='File', menu=file_menu)
-    file_menu.add_command(label='New',  command=new_image)
-    file_menu.add_command(label='Open', command=open_image)
-    file_menu.add_command(label='Save', command=save_image)
+    file_menu.add_command(label='New',            command=new_animation)
+    file_menu.add_command(label='Open (PNG/GIF)', command=open_image)
+    file_menu.add_command(label='Save frame (PNG)', command=save_image)
+    file_menu.add_command(label='Export GIF',     command=export_gif)
     file_menu.add_separator()
     file_menu.add_command(label='Exit', command=root.destroy)
     root.config(menu=menu_bar)
@@ -500,7 +722,7 @@ def setup_app():
     main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
     sidebar = tk.Frame(main_frame, width=220)
-    sidebar.grid(row=0, column=0, sticky='ns', padx=(0, 12))
+    sidebar.grid(row=0, column=0, rowspan=2, sticky='ns', padx=(0, 12))
 
     # Connection
     tk.Label(sidebar, text='Connection',
@@ -526,7 +748,7 @@ def setup_app():
     # Cable controls
     cable_frame = tk.Frame(sidebar)
     port_var   = tk.StringVar()
-    port_combo = tk.ttk.Combobox(cable_frame, textvariable=port_var, width=12)
+    port_combo = ttk.Combobox(cable_frame, textvariable=port_var, width=12)
     port_combo.pack(side='left')
     tk.Button(cable_frame, text='\u21bb', width=2,
               command=_refresh_ports).pack(side='left', padx=2)
@@ -573,20 +795,22 @@ def setup_app():
                              relief='solid', bd=1)
     color_preview.pack(fill='x')
 
-    # Tools
+    # Tools (two rows so the sidebar stays narrow)
     tk.Label(sidebar, text='Tool', font=('TkDefaultFont', 10, 'bold')).pack(anchor='w', pady=(10,4))
     tool_frame = tk.Frame(sidebar)
     tool_frame.pack(fill='x')
     global tool_buttons
     tool_buttons = {}
-    for name in ['draw', 'erase', 'fill']:
+    layout = {'draw': (0, 0), 'erase': (0, 1), 'fill': (0, 2),
+              'pick': (1, 0)}
+    for name, (r, c) in layout.items():
         btn = tk.Button(tool_frame, text=name.capitalize(), width=5,
                         command=lambda t=name: set_tool(t))
-        btn.pack(side='left', padx=2)
+        btn.grid(row=r, column=c, padx=2, pady=2)
         tool_buttons[name] = btn
     set_tool('draw')
     tk.Button(tool_frame, text='Clear', width=5,
-              command=new_image).pack(side='left', padx=2)
+              command=clear_frame).grid(row=1, column=1, padx=2, pady=2)
 
     # Canvas
     canvas_frame = tk.Frame(main_frame, bg='#e8e8e8')
@@ -601,14 +825,57 @@ def setup_app():
     canvas.bind('<B1-Motion>',       on_motion)
     canvas.bind('<ButtonRelease-1>', stop_paint)
 
+    # Animation bar (controls + frame strip) under the canvas
+    anim_frame = tk.Frame(main_frame)
+    anim_frame.grid(row=1, column=1, sticky='ew', pady=(8, 0))
+
+    ctrl = tk.Frame(anim_frame)
+    ctrl.pack(fill='x')
+
+    play_btn = tk.Button(ctrl, text='\u25b6 Play', width=7,
+                         command=_toggle_play)
+    play_btn.pack(side='left')
+
+    tk.Label(ctrl, text='FPS').pack(side='left', padx=(10, 2))
+    fps_var = tk.IntVar(value=8)
+    tk.Spinbox(ctrl, from_=1, to=30, textvariable=fps_var,
+               width=4).pack(side='left')
+
+    tk.Button(ctrl, text='+ Add', width=7,
+              command=add_frame).pack(side='left', padx=(18, 2))
+    tk.Button(ctrl, text='Duplicate', width=8,
+              command=duplicate_frame).pack(side='left', padx=2)
+    tk.Button(ctrl, text='Delete', width=6,
+              command=delete_frame).pack(side='left', padx=2)
+
+    frame_pos_lbl = tk.Label(ctrl, text='Frame 1 / 1', fg='#555',
+                             font=('TkDefaultFont', 9))
+    frame_pos_lbl.pack(side='right')
+
+    # Scrollable thumbnail strip
+    strip_canvas = tk.Canvas(anim_frame, height=THUMB_H + 28,
+                             highlightthickness=0)
+    strip_scroll = tk.Scrollbar(anim_frame, orient='horizontal',
+                                command=strip_canvas.xview)
+    strip_canvas.config(xscrollcommand=strip_scroll.set)
+    strip_inner = tk.Frame(strip_canvas)
+    strip_canvas.create_window((0, 0), window=strip_inner, anchor='nw')
+    strip_canvas.pack(fill='x', pady=(4, 0))
+    strip_scroll.pack(fill='x')
+
+    # Left/Right arrows step through frames (when not typing in a field)
+    root.bind('<Left>',  lambda e: _step_frame(-1))
+    root.bind('<Right>', lambda e: _step_frame(1))
+
     _refresh_ports()
+    _init_canvas_cells()
     redraw_canvas()
     draw_color_wheel()
+    _rebuild_frame_strip()
 
     threading.Thread(target=_serial_sender, daemon=True).start()
 
 
 if __name__ == '__main__':
-    from tkinter import ttk
     setup_app()
     root.mainloop()
