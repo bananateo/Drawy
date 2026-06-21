@@ -1,42 +1,29 @@
+"""Drawy desktop painting app (UI + entry point).
+
+All ESP32 communication lives in link.py; constants live in config.py;
+color math lives in colorutils.py. Run with:  python drawing.py
+"""
+
+import math
+import threading
 import tkinter as tk
 from tkinter import filedialog, ttk
+
 from PIL import Image, ImageDraw, ImageTk, ImageSequence
-import math
-import serial
-import serial.tools.list_ports
-import threading
-import time
-import socket
 
-# Config
-# With the SoftAP firmware the ESP32 is ALWAYS at this address join its
-# "Drawy" Wi-Fi network on the laptop, then just hit Connect
-ESP32_IP   = "192.168.4.1"
-ESP32_PORT = 1234
+from config import (
+    ESP32_IP, ESP32_PORT, NUM_MATRICES, MATRIX_HEIGHT,
+    GRID_COLS, GRID_ROWS,
+)
+from colorutils import hsl_to_rgb, rgb_to_hsl, rgb_to_hex, hex_to_rgb
+from link import LedLink, list_serial_ports
 
-NUM_MATRICES  = 4    # chained 8x32 panels - MUST MATCH FIRMWARE
-MATRIX_HEIGHT = 8    # rows per panel      - MUST MATCH FIRMWARE
-BAUD_RATE     = 500000
-
-GRID_COLS = 32
-GRID_ROWS = 8 * NUM_MATRICES
-
-# The canvas zoom (pixels per grid cell) is now DYNAMIC: it is recomputed
+# The canvas zoom (pixels per grid cell) is DYNAMIC: it is recomputed
 # whenever the window is resized, so the whole app scales like any normal
 # window. Frames are stored at native grid resolution (32x32), independent
 # of how big they are drawn on screen.
 MIN_CELL  = 6        # don't let cells get smaller than this
 cell_size = 20       # current zoom; updated on window resize
-
-CHUNK_SIZE = 20
-
-MAX_RETRIES = 5
-RETRY_DELAY = 3
-
-# Protocol headers
-HDR_A = 0xFF
-HDR_PIXELS = 0xFE
-HDR_BRIGHT = 0xFD
 
 root         = None
 brush_color  = '#000000'
@@ -52,11 +39,7 @@ saturation = 1.0
 shade      = 0.5
 wheel_radius = 80
 
-ser      = None
-ser_lock = threading.Lock()
-dirty    = False
-
-prev_leds = {}   # pixel_index -> (R, G, B)
+link = None          # LedLink instance, created in setup_app()
 
 # Animation state
 frames        = []      # list of native-resolution PIL Images
@@ -71,79 +54,6 @@ thumb_refs    = []      # keep PhotoImage references alive
 thumb_buttons = []
 canvas_rects  = []      # one canvas rectangle per grid cell, created once
 _resize_job   = None    # debounce id for window-resize events
-
-
-# Wi-Fi socket wrapper that mimics serial.Serial
-class WifiSerial:
-    def __init__(self, ip, port, timeout=2):
-        self._sock = socket.create_connection((ip, port), timeout=timeout)
-        self._sock.settimeout(timeout)
-        self.is_open = True
-
-
-    def write(self, data):
-        self._sock.sendall(data)
-
-
-    def read(self, n):
-        buf = b''
-        while len(buf) < n:
-            chunk = self._sock.recv(n - len(buf))
-            if not chunk:
-                raise ConnectionError("ESP32 disconnected")
-            buf += chunk
-        return buf
-
-
-    def reset_input_buffer(self):  pass
-    def reset_output_buffer(self): pass
-
-
-    def close(self):
-        self._sock.close()
-        self.is_open = False
-
-
-# Color helpers
-def hsl_to_rgb(h, s, l):
-    h = h % 360
-    s /= 100
-    l /= 100
-    c = (1 - abs(2 * l - 1)) * s
-    x = c * (1 - abs((h / 60) % 2 - 1))
-    m = l - c / 2
-    if   h < 60:  r, g, b = c, x, 0
-    elif h < 120: r, g, b = x, c, 0
-    elif h < 180: r, g, b = 0, c, x
-    elif h < 240: r, g, b = 0, x, c
-    elif h < 300: r, g, b = x, 0, c
-    else:         r, g, b = c, 0, x
-    return int((r + m) * 255), int((g + m) * 255), int((b + m) * 255)
-
-
-def rgb_to_hsl(r, g, b):
-    # Inverse of hsl_to_rgb, used by the eyedropper so the wheel + shade
-    # slider jump to the picked color.
-    r, g, b = r / 255, g / 255, b / 255
-    mx, mn = max(r, g, b), min(r, g, b)
-    l = (mx + mn) / 2
-    if mx == mn:
-        return 0.0, 0.0, l * 100
-    d = mx - mn
-    s = d / (1 - abs(2 * l - 1))
-    if   mx == r: h = ((g - b) / d) % 6
-    elif mx == g: h = (b - r) / d + 2
-    else:         h = (r - g) / d + 4
-    return h * 60, min(s, 1.0) * 100, l * 100
-
-
-def rgb_to_hex(r, g, b):
-    return '#{:02x}{:02x}{:02x}'.format(r, g, b)
-
-
-def hex_to_rgb(h):
-    h = h.lstrip('#')
-    return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
 
 
 # Color wheel
@@ -294,11 +204,10 @@ def apply_tool(event):
 
 
 def paint_pixel(xi, yi, color):
-    global dirty
     rgb = hex_to_rgb(color)
     image.putpixel((xi, yi), (*rgb, 255))
     canvas.itemconfig(canvas_rects[yi * GRID_COLS + xi], fill=color)
-    dirty = True
+    link.mark_dirty()
 
 
 # Eyedropper: grab the color under the cursor, sync the wheel + shade
@@ -333,8 +242,7 @@ def flood_fill(xi, yi):
         stack.extend([(x+1,y),(x-1,y),(x,y+1),(x,y-1)])
     for x, y in visited:
         image.putpixel((x, y), (*fill_rgb, 255))
-    global dirty
-    dirty = True
+    link.mark_dirty()
     redraw_canvas()
     _refresh_current_thumb()
 
@@ -354,7 +262,7 @@ def _new_blank_frame():
 
 def _select_frame(idx, rebuild=False):
     """Make frames[idx] the one shown on the canvas (and on the LEDs)."""
-    global current_frame, image, draw_img, dirty
+    global current_frame, image, draw_img
     current_frame = idx
     image    = frames[idx]
     draw_img = ImageDraw.Draw(image)
@@ -363,7 +271,7 @@ def _select_frame(idx, rebuild=False):
         _rebuild_frame_strip()
     else:
         _update_strip_selection()
-    dirty = True     # the LED panel always shows the selected frame
+    link.mark_dirty()    # the LED panel always shows the selected frame
 
 
 def add_frame():
@@ -388,11 +296,10 @@ def delete_frame():
 
 
 def clear_frame():
-    global dirty
     _stop_playback()
     draw_img.rectangle([(0, 0), (GRID_COLS - 1, GRID_ROWS - 1)],
                        fill=(0, 0, 0, 255))
-    dirty = True
+    link.mark_dirty()
     redraw_canvas()
     _refresh_current_thumb()
 
@@ -486,7 +393,7 @@ def new_animation():
     global frames
     _stop_playback()
     frames[:] = [_new_blank_frame()]
-    prev_leds.clear()
+    link.reset_history()
     _select_frame(0, rebuild=True)
 
 
@@ -506,7 +413,7 @@ def open_image():
         # Animated GIF -> replaces the whole animation
         frames[:] = [f.convert('RGBA').resize(size, Image.NEAREST)
                      for f in ImageSequence.Iterator(img)]
-        prev_leds.clear()
+        link.reset_history()
         _select_frame(0, rebuild=True)
     else:
         # Still image -> loads into the CURRENT frame only
@@ -536,172 +443,41 @@ def export_gif():
                 duration=int(1000 / _get_fps()), loop=0)
 
 
-# Forces all LEDs to turn off
-def _send_blackout():
-    if not ser or not getattr(ser, 'is_open', False):
-        return
-    PHYSICAL_COLS = NUM_MATRICES * GRID_COLS
-    PHYSICAL_ROWS = MATRIX_HEIGHT
-    total = PHYSICAL_COLS * PHYSICAL_ROWS
-    with ser_lock:
-        try:
-            for chunk_start in range(0, total, CHUNK_SIZE):
-                chunk_end = min(chunk_start + CHUNK_SIZE, total)
-                count = chunk_end - chunk_start
-                pkt = bytearray([HDR_A, HDR_PIXELS, (count >> 8) & 0xFF, count & 0xFF])
-                for pixel_index in range(chunk_start, chunk_end):
-                    pkt.extend([(pixel_index >> 8) & 0xFF, pixel_index & 0xFF, 0, 0, 0])
-                ser.write(pkt)
-                if ser.read(1) != b'K':
-                    _set_status('error', 'Blackout: no ACK')
-                    return
-            _set_status('ok', 'Cleared')
-        except Exception as e:
-            _set_status('error', f'Blackout failed: {e}')
-
-
 # LED panel brightness (separate from color shade) -> sent to the ESP32
 def on_led_brightness_release(event=None):
-    val = int(float(led_brightness_slider.get()))
-    if not ser or not getattr(ser, 'is_open', False):
-        return
-    with ser_lock:
-        try:
-            ser.write(bytearray([HDR_A, HDR_BRIGHT, val & 0xFF]))
-            if ser.read(1) != b'K':
-                _set_status('error', 'Brightness: no ACK')
-        except Exception as e:
-            _set_status('error', f'Brightness failed: {e}')
-
-
-# Frame building / sending (works for both Wi-Fi and cable)
-def _build_frame():
-    global prev_leds
-    changed = []
-
-    PHYSICAL_COLS = NUM_MATRICES * GRID_COLS   # 128 — full strip width
-    PHYSICAL_ROWS = MATRIX_HEIGHT              # 8
-
-    for canvas_row in range(GRID_ROWS):        # 0-31 in the UI
-        for canvas_col in range(GRID_COLS):    # 0-31 in the UI
-            # Convert canvas (col, row) to physical strip coordinates
-            matrix_index  = canvas_row // PHYSICAL_ROWS   # which matrix (0-3)
-            local_row     = canvas_row %  PHYSICAL_ROWS   # row within that matrix (0-7)
-            physical_col  = matrix_index * GRID_COLS + canvas_col  # col across full strip
-            pixel_index = local_row * PHYSICAL_COLS + physical_col
-
-            px  = image.getpixel((canvas_col, canvas_row))
-            rgb = (px[0], px[1], px[2])
-            if prev_leds.get(pixel_index) != rgb:
-                changed.append((pixel_index, rgb))
-
-    if not changed:
-        return None
-    for pixel_index, rgb in changed:
-        prev_leds[pixel_index] = rgb
-
-    count = len(changed)
-    pkt = bytearray([HDR_A, HDR_PIXELS, (count >> 8) & 0xFF, count & 0xFF])
-    for pixel_index, (r, g, b) in changed:
-        pkt.extend([(pixel_index >> 8) & 0xFF, pixel_index & 0xFF, r, g, b])
-    return pkt
-
-
-def _send_frame_chunked(frame_pkt):
-    total_pixels = (frame_pkt[2] << 8) | frame_pkt[3]
-    pixel_data   = frame_pkt[4:]
-    with ser_lock:
-        for i in range(0, total_pixels, CHUNK_SIZE):
-            chunk_pixels = pixel_data[i*5 : (i+CHUNK_SIZE)*5]
-            count = len(chunk_pixels) // 5
-            pkt = bytearray([HDR_A, HDR_PIXELS, (count >> 8) & 0xFF, count & 0xFF])
-            pkt.extend(chunk_pixels)
-            ser.write(pkt)
-            if ser.read(1) != b'K':
-                raise Exception(f'No ACK at chunk offset {i}')
-
-
-def _serial_sender():
-    global dirty, ser
-    while True:
-        time.sleep(1 / 30)
-        if not ser or not getattr(ser, 'is_open', False):
-            continue
-        if dirty:
-            dirty = False
-            frame = _build_frame()
-            if frame is None:
-                continue
-            try:
-                _send_frame_chunked(frame)
-            except Exception as e:
-                print(f'Send error: {e}')
-                ser = None
-                root.after(0, lambda err=e: _set_status('error', f'Lost connection: {err}'))
-                root.after(0, lambda: connect_btn.config(text='Connect'))
+    link.set_brightness(int(float(led_brightness_slider.get())))
 
 
 # Connection (transport selector: Wi-Fi or cable)
 def _refresh_ports():
-    ports = [p.device for p in serial.tools.list_ports.comports()]
+    ports = list_serial_ports()
     port_combo['values'] = ports
     if ports and not port_var.get():
         port_combo.current(0)
 
 
-def _connect_wifi(retries=MAX_RETRIES):
-    global ser
-    ip   = ip_var.get().strip() or ESP32_IP
-    port = int(port_num_var.get() or ESP32_PORT)
-    for attempt in range(1, retries + 1):
-        try:
-            _set_status('off', f'Connecting... ({attempt}/{retries})')
-            ser = WifiSerial(ip, port, timeout=5)
-            _set_status('ok', f'Connected  {ip}:{port}')
-            root.after(0, lambda: connect_btn.config(text='Disconnect'))
-            return True
-        except Exception:
-            ser = None
-            if attempt < retries:
-                time.sleep(RETRY_DELAY)
-    _set_status('error', f'Failed after {retries} attempts')
-    root.after(0, lambda: connect_btn.config(text='Connect'))
-    return False
-
-
-def _connect_cable():
-    global ser
-    port = port_var.get()
-    if not port:
-        _set_status('error', 'No port selected')
-        return
-    try:
-        ser = serial.Serial(port, BAUD_RATE, timeout=2)
-        time.sleep(3)               # wait for ESP32 reset on serial open
-        ser.reset_input_buffer()
-        ser.reset_output_buffer()
-        _set_status('ok', f'Connected  {port}')
-        connect_btn.config(text='Disconnect')
-    except Exception as e:
-        ser = None
-        _set_status('error', str(e))
-
-
 def _toggle_connect():
-    global ser
-    if ser and getattr(ser, 'is_open', False):
-        try:
-            ser.close()
-        except Exception:
-            pass
-        ser = None
-        _set_status('off', 'Disconnected')
-        connect_btn.config(text='Connect')
+    if link.is_connected():
+        link.disconnect()
         return
     if transport_var.get() == 'wifi':
-        threading.Thread(target=_connect_wifi, daemon=True).start()
+        threading.Thread(
+            target=lambda: link.connect_wifi(ip_var.get(),
+                                             port_num_var.get() or ESP32_PORT),
+            daemon=True).start()
     else:
-        _connect_cable()
+        link.connect_cable(port_var.get())
+
+
+# LedLink callbacks: may fire from a worker thread, so marshal them onto
+# the Tk main thread with root.after.
+def _on_link_status(state, text):
+    root.after(0, lambda: _set_status(state, text))
+
+
+def _on_link_conn_change(connected):
+    root.after(0, lambda: connect_btn.config(
+        text='Disconnect' if connected else 'Connect'))
 
 
 def _set_status(state, text):
@@ -726,9 +502,14 @@ def setup_app():
     global transport_var, transport_frame, wifi_frame, cable_frame
     global ip_var, port_num_var
     global play_btn, fps_var, frame_pos_lbl, strip_canvas, strip_inner
+    global link
 
     root = tk.Tk()
-    root.title(f'Drawy  —  {GRID_COLS}x{GRID_ROWS}  ({NUM_MATRICES} panels)')
+    root.title(f'Drawy  \u2014  {GRID_COLS}x{GRID_ROWS}  ({NUM_MATRICES} panels)')
+
+    link = LedLink(get_image=lambda: image,
+                   on_status=_on_link_status,
+                   on_conn_change=_on_link_conn_change)
 
     # Resizable window: start at a size that fits most screens, never
     # smaller than what the sidebar + a minimum canvas need.
@@ -857,6 +638,7 @@ def setup_app():
     # Color
     tk.Label(sidebar, text='Color', font=('TkDefaultFont', 10, 'bold')).pack(anchor='w', pady=(8,0))
     wheel_size   = wheel_radius * 2
+    global wheel_canvas
     wheel_canvas = tk.Canvas(sidebar, width=wheel_size, height=wheel_size,
                              bg='white', highlightthickness=1,
                              highlightbackground='#cccccc', cursor='crosshair')
@@ -958,7 +740,7 @@ def setup_app():
     _rebuild_frame_strip()
     root.after(50, _apply_canvas_size)   # fit the grid to the initial window
 
-    threading.Thread(target=_serial_sender, daemon=True).start()
+    link.start_sender()
 
 
 if __name__ == '__main__':
