@@ -65,7 +65,8 @@ bool readBytes(Stream* s, uint8_t* dst, int n) {
 
 void setup() {
   FastLED.addLeds<WS2812B, DATA_PIN, GRB>(leds, TOTAL_LEDS);
-  FastLED.setBrightness(50);        // starting value; app can change it live
+  FastLED.setBrightness(50);                          // starting value; app can change it live
+  FastLED.setMaxPowerInVoltsAndMilliamps(5, 4500);    // hard current ceiling, ~500mA headroom for the ESP32
   FastLED.clear();
   FastLED.show();
 
