@@ -1,6 +1,6 @@
 # Drawy
 
-An embedded project that lets you draw on a desktop app and displays the result in real time on a wall of WS2812B LED matrices.
+An embedded project that lets you draw (and animate) on a desktop app and displays the result in real time on a wall of WS2812B LED matrices.
 
 A Python painting application sends pixel data to an ESP32 - over **Wi-Fi or a USB cable** - and the ESP32 drives four chained 8×32 LED panels.
 
@@ -10,49 +10,52 @@ A Python painting application sends pixel data to an ESP32 - over **Wi-Fi or a U
 
 ```
 Python app (tkinter)  ---Wi-Fi (TCP) or USB serial--->  ESP32 (FastLED)  ---data--->  4× WS2812B 8×32 panels
-   draw / erase / fill                                 listens on both              (1024 LEDs, 32×32 grid)
+   draw / erase / fill / animate                        listens on both              (1024 LEDs, 32×32 grid)
 ```
 
-You draw on a 32×32 grid in the app. Each frame, the app sends only the pixels that changed to the ESP32, which maps them to the physical LED layout and updates the matrices.
+You draw on a 32×32 grid in the app, optionally across multiple animation frames. Each frame, the app sends only the pixels that changed to the ESP32, which maps them to the physical LED layout and updates the matrices.
 
 The ESP32 runs as its own **Wi-Fi access point** (it creates a network called `Drawy`), so it works on any laptop anywhere with no router, no phone hotspot, and no per-network reconfiguration. A USB cable can be used instead, or as a fallback.
 
 ## Hardware
 
-- **4× WS2812B 8×32 LED panels** chained in series (DIN → DOUT), forming one 32×32 grid (1024 LEDs total).
+- **4× WS2812B 8×32 LED panels** chained in series (DIN -> DOUT), forming one 32×32 grid (1024 LEDs total).
 - **ESP32** microcontroller (data on pin **13**).
 - **5V power supply** powering both the LED matrices and the ESP32 (via its 5V pin).
 - No logic level shifter — the data line is driven directly from the ESP32's output.
 
-Inside each panel the LEDs are wired in a **serpentine** pattern, and every second panel is mounted **rotated 180°**. The firmware's `getLEDIndex()` handles this mapping, so the app can send simple (column, row) coordinates.
+Inside each panel the LEDs are wired in a **serpentine** pattern, and every second panel is mounted **rotated 180 degrees**. The firmware's `getLEDIndex()` handles this mapping, so the app can send simple (column, row) coordinates.
 
 ## Software
 
 | File | Role |
 |------|------|
-| `drawing.py` | Desktop painting app (Python, `tkinter` + `Pillow`) |
+| `drawing.py` | Desktop painting and animation app (Python, `tkinter` + `Pillow`) — entry point |
+| `link.py` | Communication layer: Wi-Fi/cable connection management, wire protocol, background sender thread |
+| `colorutils.py` | Pure color-conversion helpers (HSL, RGB, hex) used by the color wheel and eyedropper |
+| `config.py` | Shared constants (panel geometry, network defaults, protocol headers) |
 | `matrixESP32.ino` | ESP32 firmware (`FastLED` + `WiFi`) |
 
-A single app and a single firmware handle both Wi-Fi and cable - there are no separate wired/wireless versions.
+The UI never talks to the serial port or socket directly - it goes through a single `LedLink` object from `link.py`. A single app and a single firmware handle both Wi-Fi and cable transports; there are no separate wired/wireless versions.
 
 ### Communication protocol
 
-The app sends only changed pixels (delta updates) for speed (~30 fps). Two packet types share the same `0xFF` lead byte:
+The app sends only changed pixels (delta updates) for speed (around 30 fps). Two packet types share the same `0xFF` lead byte:
 
 **Pixel frame**
 
-- `0xFF 0xFE` — header
-- 2 bytes — number of changed pixels
+- `0xFF 0xFE` - header
+- 2 bytes - number of changed pixels
 - per pixel: 2 bytes index + 1 byte each R, G, B
 
 **Brightness command** (sets the LED panel brightness live)
 
-- `0xFF 0xFD` — header
-- 1 byte — brightness, `0`–`255`
+- `0xFF 0xFD` - header
+- 1 byte - brightness, `0`-`255`
 
-The ESP32 replies with a single byte `'K'` (ACK) after processing each packet, then the app sends the next one. On Wi-Fi the app auto-reconnects if the connection drops.
+The ESP32 replies with a single byte `'K'` (ACK) after processing each packet, then the app sends the next one.
 
-Large frames are sent in small chunks (each a self-contained pixel frame). The firmware accumulates them into its LED buffer and refreshes the panels at a rate-limited ~30 fps, always displaying the final state of a burst.
+Large frames are sent in small chunks (each a self-contained pixel frame). The firmware accumulates them into its LED buffer and refreshes the panels at a rate-limited 30 fps, always displaying the final state of a burst.
 
 ## Setup
 
@@ -78,6 +81,22 @@ Large frames are sent in small chunks (each a self-contained pixel frame). The f
    ```bash
    python drawing.py
    ```
+
+### Building a standalone executable (optional)
+
+If you'd rather double-click an app than run a script from an editor, you can package `drawing.py` into a single executable with [PyInstaller](https://pyinstaller.org/):
+
+```bash
+pip install pyinstaller
+pyinstaller --onefile --windowed --name Drawy drawing.py
+```
+
+- `--onefile` bundles everything (including `config.py`, `colorutils.py`, and `link.py`, which PyInstaller detects automatically) into one file.
+- `--windowed` suppresses the console window, since this is a GUI app.
+
+The result lands in `dist/Drawy.exe` (Windows) or the equivalent for your OS — copy that file out and run it directly. **PyInstaller builds for whichever OS you run it on**; it doesn't cross-compile, so build on Windows for a `.exe`, on macOS for a `.app`, and so on.
+
+The generated `build/` and `dist/` folders (and the `.spec` file) are build output, not source — they're excluded via `.gitignore` and shouldn't be committed.
 
 ### Connecting
 
@@ -113,12 +132,12 @@ Pick a hue and saturation from the color wheel. The **Color shade** slider contr
 
 The app supports multi-frame animation. An animation bar sits below the drawing canvas:
 
-- **Add** — inserts a new blank frame after the current one.
-- **Duplicate** — copies the current frame.
-- **Delete** — removes the current frame (the last frame is cleared instead of deleted).
-- **Play / Stop** — plays the animation in a loop at the chosen FPS. The LED wall plays along in real time.
-- **FPS** — set the playback speed (1–30 fps).
-- **Frame strip** — a scrollable row of thumbnails below the controls. Click any thumbnail to jump to that frame. The current frame is highlighted.
+- **Add** - inserts a new blank frame after the current one.
+- **Duplicate** - copies the current frame.
+- **Delete** - removes the current frame (the last frame is cleared instead of deleted).
+- **Play / Stop** - plays the animation in a loop at the chosen FPS. The LED wall plays along in real time.
+- **FPS** - set the playback speed (1-30 fps).
+- **Frame strip** - a scrollable row of thumbnails below the controls. Click any thumbnail to jump to that frame. The current frame is highlighted.
 - **<- / ->** arrow keys also step through frames when a text field is not focused.
 
 ### File menu
@@ -138,11 +157,13 @@ The window is freely resizable. The drawing grid scales to fill the available sp
 
 These must match between the app and the firmware, or the image will map incorrectly:
 
-| Setting | `drawing.py` | `matrixESP32.ino` |
-|---------|--------------|-------------------|
+| Setting | `drawing.py` / `config.py` | `matrixESP32.ino` |
+|---------|--------------------|-------------------|
 | Number of panels | `NUM_MATRICES` | `NUM_MATRICES` |
 | Panel height | `MATRIX_HEIGHT` | `MATRIX_HEIGHT` |
 | Panel width | `GRID_COLS` (32) | `MATRIX_WIDTH` |
 | Wi-Fi address | `ESP32_IP` / `ESP32_PORT` | `AP_SSID` / `AP_PASS` / `TCP_PORT` |
+
+All of the settings above live in `config.py`, shared by `drawing.py` and `link.py`.
 
 The starting LED brightness is set in the firmware via `FastLED.setBrightness(50)` and can then be changed live from the app.
