@@ -96,8 +96,6 @@ pyinstaller --onefile --windowed --name Drawy drawing.py
 
 The result lands in `dist/Drawy.exe` (Windows) or the equivalent for your OS — copy that file out and run it directly. **PyInstaller builds for whichever OS you run it on**; it doesn't cross-compile, so build on Windows for a `.exe`, on macOS for a `.app`, and so on.
 
-The generated `build/` and `dist/` folders (and the `.spec` file) are build output, not source — they're excluded via `.gitignore` and shouldn't be committed.
-
 ### Connecting
 
 **Wi-Fi (default):**
